@@ -1,0 +1,20 @@
+{
+  "name": "chaoxing-homework-assistant",
+  "version": "1.4.0",
+  "description": "学习通作业助手：绿色免安装的 Windows 学习通作业辅助工具，支持客观题/主观题/附件题、图片识题与自动提交。",
+  "author": "七号玩家 (sevenplayer / Lsy)",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "start": "node app/server.mjs",
+    "smoke": "node tests/smoke.mjs",
+    "selftest": "node engine/selftest.mjs",
+    "test:cx": "node cx/test/parse.test.mjs && node cx/test/mock.test.mjs",
+    "build": "node build-portable.mjs",
+    "build:source": "node build-source.mjs",
+    "test:home": "node tests/home.test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

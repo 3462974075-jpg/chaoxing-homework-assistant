@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<!--
+  学习通作业助手 (Chaoxing Homework Assistant) v1.4.0
+  Copyright (c) 2026 七号玩家 (sevenplayer / Lsy). All rights reserved.
+  SPDX-License-Identifier: MIT
+  Powered by DeepSeek（AI 辅助开发）
+-->
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>学习通作业助手 · 免安装绿色版</title>
+<link rel="stylesheet" href="./style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232563eb'/%3E%3Cpath d='M9 17l5 5 9-11' stroke='%23fff' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">✓</span>
+    <span class="brand-text">学习通作业助手</span>
+    <span class="tag">绿色版</span>
+  </div>
+
+  <nav class="quick-nav" aria-label="页面内快捷跳转">
+    <button class="quick-link" type="button" data-anchor="sec-connect">连接</button>
+    <button class="quick-link" type="button" data-anchor="sec-works">作业</button>
+    <button class="quick-link" type="button" data-anchor="sec-run">运行</button>
+    <button class="quick-link" type="button" data-anchor="sec-settings">设置与隐私</button>
+  </nav>
+
+  <div class="status-badges" aria-label="就绪状态">
+    <span class="status-badge" id="badge-env" title="运行环境">环境检测中…</span>
+    <span class="status-badge" id="badge-ai" title="DeepSeek API Key">AI 引擎</span>
+    <span class="status-badge" id="badge-cx" title="学习通登录状态">学习通</span>
+    <span class="status-badge" id="badge-conn" title="实时事件连接状态">连接中…</span>
+  </div>
+
+  <button class="btn btn-sm" type="button" id="refresh-state">刷新状态</button>
+</header>
+
+<div id="global-banner" class="global-banner" role="status" hidden></div>
+
+<main class="main">
+
+  <!-- ① 连接 -->
+  <section class="section" id="sec-connect" aria-labelledby="title-connect">
+    <div class="section-head">
+      <div>
+        <h2 class="section-title" id="title-connect"><span class="sec-num">1</span>连接</h2>
+        <p class="section-desc">配置 DeepSeek API Key 与学习通账号，并完成登录。账密与 Key 均使用 Windows DPAPI 加密保存在程序目录，界面不回显。</p>
+      </div>
+    </div>
+    <div class="connect-grid" id="connect-body"></div>
+  </section>
+
+  <!-- ② 作业列表 -->
+  <section class="section" id="sec-works" aria-labelledby="title-works">
+    <div class="section-head">
+      <div>
+        <h2 class="section-title" id="title-works"><span class="sec-num">2</span>作业列表</h2>
+        <p class="section-desc">按课程分组显示未完成作业，勾选后点「开始运行」；支持全选 / 反选。</p>
+      </div>
+    </div>
+    <div id="works-toolbar"></div>
+    <div id="works-groups"></div>
+  </section>
+
+  <!-- ③ 运行 -->
+  <section class="section" id="sec-run" aria-labelledby="title-run">
+    <div class="section-head">
+      <div>
+        <h2 class="section-title" id="title-run"><span class="sec-num">3</span>运行</h2>
+        <p class="section-desc">实时显示逐项进度、日志与暂停项；缺资料或需人工验证时在此提示。</p>
+      </div>
+      <div class="section-actions">
+        <button class="btn btn-sm" type="button" id="btn-refresh-works">刷新作业列表</button>
+      </div>
+    </div>
+    <div class="run-layout">
+      <div class="run-main">
+        <div id="run-status"></div>
+        <div id="run-paused"></div>
+        <div id="run-jobs"></div>
+      </div>
+      <aside class="run-side" id="run-log" aria-label="实时日志"></aside>
+    </div>
+  </section>
+
+  <!-- ④ 设置与隐私 -->
+  <section class="section" id="sec-settings" aria-labelledby="title-settings">
+    <div class="section-head">
+      <div>
+        <h2 class="section-title" id="title-settings"><span class="sec-num">4</span>设置与隐私</h2>
+        <p class="section-desc">运行策略、数据目录与本地数据清除。所有数据只保存在程序目录，不写注册表。</p>
+      </div>
+    </div>
+    <div id="settings-body"></div>
+  </section>
+
+</main>
+
+<footer class="footer">
+  数据仅保存在程序目录 · 不写注册表 · 账密 / Cookie 使用 Windows DPAPI 加密 · 仅在本机与 DeepSeek API、学习通之间通信
+  <br>本工具仅用于辅助完成本人学习通账号下的作业；作业内容与学术诚信责任由使用者承担。
+  <br><span class="footer-copyright">学习通作业助手 v1.4.0 · © 2026 七号玩家（sevenplayer / Lsy） · Powered by DeepSeek（AI 辅助开发） · MIT License</span>
+</footer>
+
+<div id="toast-root" class="toast-root" aria-live="polite" aria-atomic="false"></div>
+<div id="modal-root" class="modal-root" hidden></div>
+
+<script src="./app.js"></script>
+</body>
+</html>

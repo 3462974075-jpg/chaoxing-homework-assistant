@@ -1,0 +1,20 @@
+学习通作业助手（Chaoxing Homework Assistant）· v1.4.0
+============================================================
+
+版权所有 © 2026 七号玩家（sevenplayer / Lsy）
+
+作者 / Author：七号玩家（sevenplayer / Lsy）
+项目名称 / Project：学习通作业助手（Chaoxing Homework Assistant）
+开源协议 / License：MIT License（详见 LICENSE 文件）
+Powered by DeepSeek（AI 辅助开发）
+
+本软件按 MIT 许可证开源，允许使用、复制、修改、合并、发布、分发、再许可和/或销售
+本软件的副本；但必须在所有副本或主要部分中保留上述版权声明与许可声明。
+
+本软件是独立的学习通辅助工具，与超星/学习通官方无任何隶属关系。
+请仅用于本人账号，遵守学校与平台的使用规定；AI 生成内容请自行核对。
+
+------------------------------------------------------------
+Copyright (c) 2026 七号玩家 (sevenplayer / Lsy). All rights reserved.
+Licensed under the MIT License.
+Powered by DeepSeek (AI-assisted development).

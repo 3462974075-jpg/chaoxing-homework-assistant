@@ -1,0 +1,34 @@
+# 运行数据（含登录态/API Key，绝不提交）
+data/
+logs/
+runtime/
+dsh/
+
+# 依赖与构建产物
+node_modules/
+dist-staging/
+build-staging/
+*.tmp
+
+# 开发期临时目录 / 测试根
+_tmp/
+_probe/
+probe-*/
+test-cx*/
+test-root*/
+test-engine*/
+test-ui*/
+test-e2e*/
+portable-test*/
+portable space test/
+stdio-probe/
+dpapi-probe.cjs
+probe-*.cjs
+probe-*.txt
+probe-*.log
+probe-*.json
+probe-*.jsonl
+
+# 测试证据 / 备份 / 输出
+测试证据/
+用户数据备份_*/
