@@ -1,5 +1,5 @@
 /**
- * 学习通作业助手 (Chaoxing Homework Assistant) v1.5.0
+ * 学习通作业助手 (Chaoxing Homework Assistant) v1.7.2
  * Copyright (c) 2026 七号玩家 (sevenplayer / Lsy). All rights reserved.
  * SPDX-License-Identifier: MIT
  * Powered by DeepSeek（AI 辅助开发）
@@ -136,6 +136,7 @@ console.log('\n[3] 编排器流程（fake cx/engine）');
   const ja = jobs3.get('1001');
   const changed = ja && ja.accuracy && Array.isArray(ja.accuracy.changed) ? ja.accuracy.changed : [];
   ok(changed.length === 1, '目标正确率 80% 按题数改错 1 题', JSON.stringify(ja && ja.accuracy));
+  ok(ja && ja.status === 'paused' && ja.paused && ja.paused.kind === 'review', '非 99% 改错后进入待确认提交', ja && ja.status + '/' + (ja.paused && ja.paused.kind));
   const baseline = { q1: 'A', q2: 'ABC', q3: ['分隔符'] };
   const changedQid = changed[0] && changed[0].qid;
   if (changedQid) {
@@ -143,6 +144,8 @@ console.log('\n[3] 编排器流程（fake cx/engine）');
     const after = JSON.stringify(ja.answers && ja.answers.answers ? ja.answers.answers[changedQid] : null);
     ok(before !== after, '改错后答案与原答案不同', before + ' -> ' + after);
   }
+  const accSubmitted = await orch3.submitReview('1001');
+  ok(accSubmitted.outcome === 'done' && jobs3.get('1001').status === 'done', '确认改错检查后提交成功', JSON.stringify(accSubmitted));
   events3.close();
   events.close();
   events2.close();

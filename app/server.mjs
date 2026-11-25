@@ -1,5 +1,5 @@
 /**
- * 学习通作业助手 (Chaoxing Homework Assistant) v1.5.0
+ * 学习通作业助手 (Chaoxing Homework Assistant) v1.7.2
  * Copyright (c) 2026 七号玩家 (sevenplayer / Lsy). All rights reserved.
  * SPDX-License-Identifier: MIT
  * Powered by DeepSeek（AI 辅助开发）
@@ -147,6 +147,10 @@ async function buildState() {
     errorHint: j.errorHint || '',
     errorRaw: j.errorRaw || '',
     accuracy: j.accuracy || null,
+    highAccuracy: j.highAccuracy || null,
+    formulaWarning: j.formulaWarning || null,
+    formulaError: j.formulaError || '',
+    skippedQuestions: Array.isArray(j.skippedQuestions) ? j.skippedQuestions : [],
     updatedAt: j.updatedAt,
   }));
   const paused = jobs.list()
@@ -160,6 +164,10 @@ async function buildState() {
       detail: (j.paused && j.paused.detail) || [],
       missingQuestions: (j.paused && j.paused.missingQuestions) || [],
       reviewQuestions: (j.paused && j.paused.reviewQuestions) || [],
+      accuracyChanges: (j.paused && j.paused.accuracyChanges) || [],
+      skippedQuestions: Array.isArray(j.skippedQuestions) ? j.skippedQuestions : [],
+      skippableQuestions: (j.paused && j.paused.skippableQuestions) || [],
+      highAccuracyTies: (j.paused && j.paused.highAccuracyTies) || [],
       createdAt: (j.paused && j.paused.at) || j.updatedAt,
     }));
   const dsh = checkDsh();
@@ -200,6 +208,7 @@ function publicConfig() {
     port: config.port,
     autoSubmit: config.autoSubmit,
     targetAccuracy: config.targetAccuracy,
+    highAccuracy: config.highAccuracy === true,
     reviewBeforeSubmit: config.reviewBeforeSubmit !== false,
     model: config.model,
     engineTimeoutSec: config.engineTimeoutSec,
@@ -446,6 +455,30 @@ async function handleApi(req, res, url) {
     }
   }
 
+  const reviewRescueMatch = p.match(/^\/api\/jobs\/([^/]+)\/rescue$/);
+  if (method === 'POST' && reviewRescueMatch) {
+    const workId = decodeURIComponent(reviewRescueMatch[1]);
+    try {
+      const result = await orchestrator.rescueJob(workId);
+      return sendJson(res, 200, { ok: true, ...result });
+    } catch (e) {
+      return sendJson(res, 400, { ok: false, error: humanizeError(e).message, detail: humanizeError(e) });
+    }
+  }
+
+  const reviewSkipMatch = p.match(/^\/api\/jobs\/([^/]+)\/skip$/);
+  if (method === 'POST' && reviewSkipMatch) {
+    const workId = decodeURIComponent(reviewSkipMatch[1]);
+    const body = await readBody(req).catch(() => ({}));
+    if (!body || !body.qid) return sendJson(res, 400, { ok: false, error: '缺少 qid' });
+    try {
+      const result = await orchestrator.skipQuestion(workId, body.qid);
+      return sendJson(res, 200, result);
+    } catch (e) {
+      return sendJson(res, 400, { ok: false, error: humanizeError(e).message });
+    }
+  }
+
   const matMatch = p.match(/^\/api\/jobs\/([^/]+)\/materials$/);
   if (method === 'POST' && matMatch) {
     const workId = decodeURIComponent(matMatch[1]);
@@ -472,12 +505,15 @@ async function handleApi(req, res, url) {
 
   if (method === 'POST' && p === '/api/settings') {
     const body = await readBody(req);
-    const allowed = ['autoSubmit', 'engineTimeoutSec', 'loginTimeoutSec', 'model', 'targetAccuracy', 'reviewBeforeSubmit'];
+    const allowed = ['autoSubmit', 'engineTimeoutSec', 'loginTimeoutSec', 'model', 'targetAccuracy', 'reviewBeforeSubmit', 'highAccuracy'];
     for (const k of allowed) {
       if (body[k] !== undefined) config[k] = body[k];
     }
     if (config.targetAccuracy !== undefined) config.targetAccuracy = normalizeTargetAccuracy(config.targetAccuracy);
     if (config.reviewBeforeSubmit !== undefined) config.reviewBeforeSubmit = config.reviewBeforeSubmit !== false;
+    if (config.highAccuracy !== undefined) config.highAccuracy = config.highAccuracy === true;
+    // 高正确率只在 99% 档生效；切到其他正确率时自动关闭
+    if (Number(config.targetAccuracy) !== 0.99) config.highAccuracy = false;
     saveConfig(config);
     events.info('设置已保存');
     return sendJson(res, 200, { ok: true, config: publicConfig() });

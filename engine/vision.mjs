@@ -1,5 +1,5 @@
 /**
- * 学习通作业助手 (Chaoxing Homework Assistant) v1.5.0
+ * 学习通作业助手 (Chaoxing Homework Assistant) v1.7.2
  * Copyright (c) 2026 七号玩家 (sevenplayer / Lsy). All rights reserved.
  * SPDX-License-Identifier: MIT
  * Powered by DeepSeek（AI 辅助开发）
@@ -32,6 +32,19 @@ export const DEFAULT_OCR_PROMPT = [
   '3) 如果图片是教材/作业页照片，按从上到下、从左到右的顺序转录；',
   '4) 只输出文字本身。',
 ].join('\n');
+
+/** 作答页截图专用：重点保留数学公式；复杂/不确定时追加标记，供 UI 提醒用户核对。 */
+export const FORMULA_OCR_PROMPT = [
+  '你在识别学习通作业作答页截图。请逐题提取文字：',
+  '1) 保留题号、题干、选项（A/B/C/D）、填空位置、单位；',
+  '2) 数学公式尽量转成 LaTeX（如 $\\frac{a}{b}$、$x^2$），不要省略公式；',
+  '3) 不要总结、不要解释、不要编造图片中没有的内容；',
+  '4) 如果某道题有复杂公式、看不清或无法确定，在输出最后单独一行写：[[FORMULA_UNCERTAIN]]',
+  '5) 只输出文字本身（含必要的标记行）。',
+].join('\n');
+
+/** 复杂/不确定公式标记（由视觉模型在末尾输出） */
+export const FORMULA_UNCERTAIN_MARKER = '[[FORMULA_UNCERTAIN]]';
 
 const IMAGE_EXT = /\.(png|jpe?g|webp|bmp|gif|tif?f)$/i;
 const MEDIA_TYPES = {
@@ -211,6 +224,7 @@ export async function ocrImages({
   baseURL = process.env.DEEPSEEK_BASE_URL || DEFAULT_VISION_BASE_URL,
   prompt = DEFAULT_OCR_PROMPT,
   maxTokens = 8192,
+  maxPixels = 2000,
   timeoutMs = 120000,
   log = () => {},
   onEvent = () => {},
@@ -230,7 +244,7 @@ export async function ocrImages({
     let st = { size: 0, mtimeMs: 0 };
     try { st = fs.statSync(file); } catch {}
     const cacheKey = cacheDir
-      ? path.join(cacheDir, `${sha1(`${file}|${st.size}|${st.mtimeMs}|${model}|${prompt}`)}.txt`)
+      ? path.join(cacheDir, `${sha1(`${file}|${st.size}|${st.mtimeMs}|${model}|${prompt}|${maxPixels}`)}.txt`)
       : '';
     if (cacheKey && fs.existsSync(cacheKey)) {
       const cached = fs.readFileSync(cacheKey, 'utf8');
@@ -243,7 +257,7 @@ export async function ocrImages({
     log(`[vision] 识别图片 ${i + 1}/${images.length}：${name}（${(st.size / 1024 / 1024).toFixed(2)}MB）`);
     let prepared = null;
     try {
-      prepared = await prepareImage(file, { tmpDir: cacheDir ? path.join(cacheDir, 'tmp') : '' });
+      prepared = await prepareImage(file, { tmpDir: cacheDir ? path.join(cacheDir, 'tmp') : '', maxPixels });
       const r = await callVision({
         apiKey: key, baseURL, model,
         imageFile: prepared.file, mediaType: prepared.mediaType,
@@ -273,4 +287,4 @@ export async function ocrImages({
   return { ok: texts.length > 0, texts, combined, errors, model, attempted: images.length };
 }
 
-export default { ocrImages, prepareImage, isImageFile, readDshApiKey, DEFAULT_OCR_PROMPT, DEFAULT_VISION_MODEL };
+export default { ocrImages, prepareImage, isImageFile, readDshApiKey, DEFAULT_OCR_PROMPT, FORMULA_OCR_PROMPT, FORMULA_UNCERTAIN_MARKER, DEFAULT_VISION_MODEL };

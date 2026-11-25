@@ -1,5 +1,5 @@
 /**
- * 学习通作业助手 (Chaoxing Homework Assistant) v1.5.0
+ * 学习通作业助手 (Chaoxing Homework Assistant) v1.7.2
  * Copyright (c) 2026 七号玩家 (sevenplayer / Lsy). All rights reserved.
  * SPDX-License-Identifier: MIT
  * Powered by DeepSeek（AI 辅助开发）
@@ -15,6 +15,8 @@
  *     填空 input[name=tiankongsize<qid>] 给出空数，UEditor 名为 answerEditor<qid><n>
  *   - 数学题：img.ans-latex-moudle[data] 是 encodeURIComponent 后的 JSON 字符串，解码即公式文本
  */
+import fs from 'node:fs';
+import path from 'node:path';
 import { ensureLoggedIn, getCoursePageParams } from './course.mjs';
 
 // ---------------------------------------------------------------- 文本工具
@@ -321,11 +323,13 @@ const EXTRACT_QUESTIONS_JS = `(() => {
     return String(s == null ? '' : s);
   };
   const textWithLatex = (root) => {
-    if (!root) return '';
+    if (!root) return { text: '', hasLatex: false, imgCount: 0 };
     const clone = root.cloneNode(true);
     let hasLatex = false;
+    let imgCount = 0;
     try {
       clone.querySelectorAll('img').forEach((img) => {
+        imgCount += 1;
         const cls = String(img.getAttribute('class') || '');
         let txt = '';
         if (/ans-latex-moudle|ans-formula-moudle|latex/i.test(cls) && img.getAttribute('data')) {
@@ -339,13 +343,14 @@ const EXTRACT_QUESTIONS_JS = `(() => {
         if (img.parentNode) img.parentNode.replaceChild(span, img);
       });
     } catch (e) {}
-    return { text: clean(clone.innerText || clone.textContent || ''), hasLatex };
+    return { text: clean(clone.innerText || clone.textContent || ''), hasLatex, imgCount };
   };
   const out = [];
   const nodes = [...document.querySelectorAll('.questionLi')];
   nodes.forEach((li, idx) => {
     const qid = String(li.getAttribute('data') || (li.id || '').replace(/^question/, '') || '').trim();
     if (!qid) return;
+    const imageCount = li.querySelectorAll('img').length;
     const typeHint = String(li.getAttribute('typename') || li.getAttribute('typeName') || '').trim();
     const shallow = li.querySelector('.colorShallow');
     const typename = clean((typeHint || (shallow ? shallow.innerText : '') || '').replace(/[()（）\\s]/g, ''));
@@ -440,6 +445,7 @@ const EXTRACT_QUESTIONS_JS = `(() => {
       blanks,
       blankCount,
       latex,
+      imageCount,
       attachments,
       required: !/选做|可不答|不要求/.test(stem),
       index: idx + 1,
@@ -486,6 +492,7 @@ export async function extractQuestions(page) {
       opts: Array.isArray(q.opts) ? q.opts.map((o) => ({ key: String(o.key || ''), text: String(o.text || '') })) : [],
       blanks: Array.isArray(q.blanks) ? q.blanks : [],
       latex: Boolean(q.latex),
+      imageCount: Number(q.imageCount) || 0,
       attachments: Array.isArray(q.attachments) ? q.attachments : [],
       required: q.required !== false,
     }));
@@ -788,6 +795,7 @@ export function parseQuestionsFromHtml(html) {
       blanks,
       blankCount,
       latex: /ans-latex-moudle|ans-formula-moudle/i.test(block),
+      imageCount: (String(block || '').match(/<img\b/gi) || []).length,
       attachments: attach,
       required: !/选做|可不答|不要求/.test(stem),
     });
@@ -914,4 +922,71 @@ export async function openWork(browser, session, work, { allowView = false, log 
   }
 }
 
-export default { parseWorkList, listWorks, openWork, openWorkHttp, extractQuestions, getAttachments, computeKind };
+/**
+ * v1.6：截取受控作答页的题目区域（只截题目，不截桌面/其他窗口），供公式视觉识别兜底。
+ * 返回 [{ path, index, qid, width, height }]；若无法逐题截图，回退一张当前页截图。
+ */
+export async function captureQuestionScreenshots(browser, session, work, outDir, { log = () => {}, qids = [] } = {}) {
+  if (!browser) throw new Error('captureQuestionScreenshots 需要受控浏览器');
+  const target = work && (work.taskUrl || work.url);
+  if (!target) throw new Error('captureQuestionScreenshots 需要作业 URL');
+  const wanted = new Set((qids || []).map(String).filter(Boolean));
+  fs.mkdirSync(outDir, { recursive: true });
+  const page = await ensureLoggedIn(browser, session, { log, keepPage: true });
+  let cur = '';
+  try { cur = String(await page.url()); } catch { cur = ''; }
+  if (cur !== target) await page.navigate(target, { settleMs: 1500 });
+  const ok = await page.waitFor(`document.querySelectorAll('.questionLi').length > 0`, { timeoutMs: 20000, intervalMs: 500 });
+  if (!ok) throw new Error('没有打开作答页，无法截图');
+
+  const count = Number(await page.eval(`document.querySelectorAll('.questionLi').length`) || 0);
+  const out = [];
+  for (let i = 0; i < count; i += 1) {
+    try {
+      const qid = String(await page.eval(`(() => { const n = document.querySelectorAll('.questionLi')[${i}]; return n ? (n.getAttribute('data') || '') : ''; })()`) || '');
+      if (wanted.size && !wanted.has(qid)) continue;
+      await page.eval(`(() => { const n = document.querySelectorAll('.questionLi')[${i}]; if (n) n.scrollIntoView({ block: 'center' }); return true; })()`);
+      await new Promise((r) => setTimeout(r, 250));
+      const rect = await page.evalJson(`(() => {
+        const n = document.querySelectorAll('.questionLi')[${i}];
+        if (!n) return null;
+        const r = n.getBoundingClientRect();
+        return { x: r.left + window.scrollX, y: r.top + window.scrollY, w: r.width, h: r.height, qid: n.getAttribute('data') || '' };
+      })()`);
+      if (!rect || !Number.isFinite(rect.w) || !Number.isFinite(rect.h)) continue;
+      const width = Math.max(1, Math.min(1800, Math.round(rect.w)));
+      const height = Math.max(1, Math.min(5000, Math.round(rect.h)));
+      if (width < 40 || height < 30) continue;
+      const shot = await page.cdp.send('Page.captureScreenshot', {
+        format: 'png',
+        captureBeyondViewport: true,
+        clip: {
+          x: Math.max(0, Number(rect.x) || 0),
+          y: Math.max(0, Number(rect.y) || 0),
+          width,
+          height,
+          scale: 1,
+        },
+      }, page.sid, 20000);
+      const file = path.join(outDir, `question-${String(i + 1).padStart(2, '0')}.png`);
+      fs.writeFileSync(file, Buffer.from(shot.data, 'base64'));
+      out.push({ path: file, index: i + 1, qid: String(rect.qid || ''), width, height });
+      log(`已截取第 ${i + 1} 题（${width}x${height}）`);
+    } catch (e) {
+      log(`第 ${i + 1} 题截图失败：${e.message}`);
+    }
+  }
+  if (!out.length) {
+    if (wanted.size) {
+      log(`没有找到指定题号对应的题目（${[...wanted].join(',')}），不退回整页识别`);
+      return [];
+    }
+    const file = path.join(outDir, 'page.png');
+    await page.screenshot(file);
+    out.push({ path: file, index: 0, qid: '', width: 0, height: 0 });
+    log('逐题截图失败，已回退整页截图');
+  }
+  return out;
+}
+
+export default { parseWorkList, listWorks, openWork, openWorkHttp, extractQuestions, getAttachments, computeKind, captureQuestionScreenshots };

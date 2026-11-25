@@ -1,5 +1,5 @@
 /**
- * 学习通作业助手 (Chaoxing Homework Assistant) v1.5.0
+ * 学习通作业助手 (Chaoxing Homework Assistant) v1.7.2
  * Copyright (c) 2026 七号玩家 (sevenplayer / Lsy). All rights reserved.
  * SPDX-License-Identifier: MIT
  * Powered by DeepSeek（AI 辅助开发）
@@ -21,7 +21,7 @@ import { Browser } from './browser.mjs';
 import { SessionManager } from './session.mjs';
 import { login as doLogin, LoginError } from './login.mjs';
 import { listCourses } from './course.mjs';
-import { listWorks, openWork } from './works.mjs';
+import { listWorks, openWork, captureQuestionScreenshots } from './works.mjs';
 import { fillAnswers, save as saveAnswers, saveCurrent as saveCurrentAnswers, submit as submitAnswers, redo as redoWork } from './submit.mjs';
 import { downloadAttachments, uploadAttachment } from './attach.mjs';
 
@@ -201,6 +201,11 @@ export async function createCx({ dataDir, edgeProfileDir, log, port, headless = 
     /** 重做当前作业 */
     async redo(work) {
       return redoWork(browser, session, resolveWork(work), { log: logger });
+    },
+
+    /** v1.7.2：按题号截取作答页题目区域（公式图片识别兜底；只截受控页面） */
+    async captureQuestionScreenshots(work, outDir, opts = {}) {
+      return captureQuestionScreenshots(browser, session, resolveWork(work), outDir, { log: logger, ...opts });
     },
 
     /** 上传附件（作答页 UEditor 附件按钮） */

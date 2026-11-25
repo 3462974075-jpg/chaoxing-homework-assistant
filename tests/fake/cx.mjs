@@ -1,5 +1,5 @@
 /**
- * 学习通作业助手 (Chaoxing Homework Assistant) v1.5.0
+ * 学习通作业助手 (Chaoxing Homework Assistant) v1.7.2
  * Copyright (c) 2026 七号玩家 (sevenplayer / Lsy). All rights reserved.
  * SPDX-License-Identifier: MIT
  * Powered by DeepSeek（AI 辅助开发）
@@ -31,7 +31,7 @@ export async function createCx({ dataDir, edgeProfileDir, log } = {}) {
         return {
           workId: work.workId,
           taskUrl: 'fake://dowork/1002',
-          questions: [{ qid: 'q100', type: 'other', stem: '请按模板完成第6次作业并上传', opts: [], blanks: [] }],
+          questions: [{ qid: 'q100', type: 'short', stem: '请按模板完成第6次作业并上传', opts: [], blanks: [] }],
           attachments: [{ name: '第6次作业模板.docx', url: 'fake://tpl/6.docx' }],
         };
       }
@@ -52,6 +52,7 @@ export async function createCx({ dataDir, edgeProfileDir, log } = {}) {
     async saveCurrent(work) { say('fake saveCurrent', work.workId); return { ok: true, raw: { status: 1, saved: true } }; },
     async submitAnswers(work, answers) { submitted.add(work.workId); say('fake submit', work.workId); return { ok: true, raw: { status: 1, msg: '提交成功' } }; },
     async uploadAttachment(work, filePath) { say('fake upload', work.workId, filePath); return { ok: true, raw: { status: 1 } }; },
+    async captureQuestionScreenshots(work, outDir) { say('fake screenshots', work.workId); return []; },
     async close() {},
   };
 }

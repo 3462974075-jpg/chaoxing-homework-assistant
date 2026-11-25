@@ -1,5 +1,5 @@
 /**
- * 学习通作业助手 (Chaoxing Homework Assistant) v1.5.0
+ * 学习通作业助手 (Chaoxing Homework Assistant) v1.7.2
  * Copyright (c) 2026 七号玩家 (sevenplayer / Lsy). All rights reserved.
  * SPDX-License-Identifier: MIT
  * Powered by DeepSeek（AI 辅助开发）
@@ -15,6 +15,16 @@ import { humanizeError } from './errors.mjs';
 
 const OBJECTIVE_TYPES = new Set(['single', 'multi', 'judge', 'blank', 'choice', 'truefalse']);
 const SHORT_TYPES = new Set(['short', 'essay', 'subjective', 'answer']);
+
+const FORMULA_OCR_PROMPT = [
+  '你在识别学习通作业作答页截图。请逐题提取文字：',
+  '1) 保留题号、题干、选项（A/B/C/D）、填空位置、单位；',
+  '2) 数学公式尽量转成 LaTeX（如 $\\frac{a}{b}$、$x^2$），不要省略公式；',
+  '3) 不要总结、不要解释、不要编造图片中没有的内容；',
+  '4) 如果某道题有复杂公式、看不清或无法确定，在输出最后单独一行写：[[FORMULA_UNCERTAIN]]',
+  '5) 只输出文字本身（含必要的标记行）。',
+].join('\n');
+const FORMULA_UNCERTAIN_MARKER = '[[FORMULA_UNCERTAIN]]';
 
 function compactWork(w) {
   return {
@@ -468,7 +478,9 @@ export class Orchestrator {
       }
 
       // 3. 分类题目
-      const objective = job.questions.filter((q) => OBJECTIVE_TYPES.has(String(q.type || '').toLowerCase()));
+      const objectiveAll = job.questions.filter((q) => OBJECTIVE_TYPES.has(String(q.type || '').toLowerCase()));
+      const skippedSet = new Set((job.skippedQuestions || []).map(String));
+      const objective = objectiveAll.filter((q) => !skippedSet.has(String(q.qid)));
       const shorts = job.questions.filter((q) => SHORT_TYPES.has(String(q.type || '').toLowerCase()));
       const other = job.questions.filter((q) => !objective.includes(q) && !shorts.includes(q));
       const needsFile = job.kind === 'attach' || job.kind === 'mixed' || attachments.length > 0 || other.length > 0;
@@ -512,8 +524,18 @@ export class Orchestrator {
         ...userMaterials,
       ];
       const template = pickTemplate(materialFiles);
-      const materialsText = await this._materialsText(materialFiles);
-
+      let materialsText = await this._materialsText(materialFiles);
+      const manualOcrBefore = job.formulaOcr;
+      // v1.7.2：只对“题目里确实有图片”的题号做主动截图识别，避免整页 OCR
+      const imageQids = job.questions.filter((q) => Number(q.imageCount) > 0 || q.latex).map((q) => String(q.qid));
+      if (imageQids.length && !job.formulaRescueAttempted) {
+        const rescue = await this._tryFormulaRescue({ work, job, cx, engine, materialsText, emit, qids: imageQids });
+        if (rescue.ok) materialsText = rescue.materialsText;
+      }
+      if (manualOcrBefore) {
+        // 用户在暂停/失败后用「再次识别」手动补充的 OCR 结果，也加入下一次运行
+        materialsText = `${materialsText}${materialsText ? '\n\n' : ''}【手动重新识别的作答页公式】\n${String(manualOcrBefore).slice(0, 30000)}`;
+      }
       // 4. 客观题：联网求解（引擎内部会按批分片；已答过的题直接复用，只补缺失）
       if (objective.length) {
         const toSolve = objective.filter((q) => !answers.answers[q.qid]);
@@ -534,11 +556,35 @@ export class Orchestrator {
               emit('engine', ev);
             },
           });
-          let solved = await solveOnce(toSolve, `联网求解 ${toSolve.length} 道客观题`);
+          let solved = null;
+          const highAccuracyEnabled = this.config.highAccuracy === true
+            && accuracy.normalizeTargetAccuracy(this.config.targetAccuracy) === 0.99;
+          if (highAccuracyEnabled) {
+            setPhase('solve', `高正确率：客观题做 3 次投票（${toSolve.length} 题）`);
+            const high = await this._solveHighAccuracy({ solveOnce, questions: toSolve });
+            job.highAccuracy = {
+              enabled: true,
+              rounds: 3,
+              ties: high.ties,
+              at: new Date().toISOString(),
+            };
+            this.jobs.save(job);
+            solved = { ok: Object.keys(high.answers).length > 0, answers: high.answers, sources: high.sources, missing: high.missing };
+            if (high.missing.length) this.events.warn(`高正确率有 ${high.missing.length} 道题没有可用答案：${high.missing.slice(0, 20).join(',')}`);
+            if (high.ties.length) {
+              this.events.warn(`高正确率有 ${high.ties.length} 道题出现三次不同答案，已随机选用并将在提交前要求人工复核。`);
+              emit('high-accuracy', { workId: job.workId, ties: high.ties, rounds: 3 });
+            } else {
+              this.events.info('高正确率：3 次投票没有出现三次全不同答案，无需额外人工复核。');
+            }
+          } else {
+            solved = await solveOnce(toSolve, `联网求解 ${toSolve.length} 道客观题`);
+          }
+          let errDetail = {};
           // 部分成功：保留已得答案，再把缺失的题补一次（252 题这类大作业不会整份失败）
           if (solved && solved.ok === false) {
             const partial = solved.answers || {};
-            const errDetail = (solved.error && solved.error.detail) || {};
+            errDetail = (solved.error && solved.error.detail) || {};
             const missing = (solved.missing || errDetail.failedQids || []).map(String);
             if (Object.keys(partial).length) {
               Object.assign(answers.answers, partial);
@@ -557,15 +603,37 @@ export class Orchestrator {
             }
           }
           if (!solved || solved.ok === false) {
+            // v1.6：如果 AI 因公式图片判缺资料，先截取作答页做视觉识别，再补解一次
+            const retryQidsForRescue = toSolve.filter((q) => !answers.answers[q.qid]).map((q) => String(q.qid));
+            const rescue = await this._tryFormulaRescue({ work, job, cx, engine, materialsText, emit, qids: retryQidsForRescue });
+            if (rescue.ok) {
+              materialsText = rescue.materialsText;
+              const retryQs = toSolve.filter((q) => !answers.answers[q.qid]);
+              if (retryQs.length) {
+                this.events.warn(`截图识别后补解 ${retryQs.length} 道题…`);
+                const retry = await solveOnce(retryQs, `截图识别后补解 ${retryQs.length} 道题`);
+                if (retry && retry.answers) {
+                  Object.assign(answers.answers, retry.answers);
+                  if (retry.sources) sources.push(...retry.sources);
+                }
+                if (retry && retry.ok !== false) solved = { ...retry, ok: true, missing: [] };
+              }
+            }
+          }
+          if (!solved || solved.ok === false) {
             const err = (solved && solved.error) || {};
             const detail = [err.message || 'AI 未返回有效结果'];
             if (solved && solved.missing && solved.missing.length) detail.push(`未解出题号：${solved.missing.slice(0, 30).join(',')}`);
             if (solved && Array.isArray(solved.failedBatches) && solved.failedBatches.length) {
               detail.push('失败批次：' + solved.failedBatches.map((b) => `#${b.index}(${(b.error && b.error.code) || '?'})`).join(' '));
             }
-            const missingQids = (solved && (solved.missing || errDetail.failedQids)) || [];
+            if (job.formulaError) detail.push('公式截图识别：' + job.formulaError);
+            const missingQids = (solved && (solved.missing || (errDetail && errDetail.failedQids))) || [];
             this._writeManualTemplate(job, missingQids);
-            return this._pauseJob(job, 'materials', this._enginePauseReason('求解', err), detail, emit, {
+            const reason = job.formulaError
+              ? `公式/图片识别失败：${job.formulaError}`
+              : this._enginePauseReason('求解', err);
+            return this._pauseJob(job, 'materials', reason, detail, emit, {
               missingQuestions: this._questionRefs(missingQids, job.questions),
             });
           }
@@ -581,15 +649,55 @@ export class Orchestrator {
           }
           finishStep('solve', `已得到 ${objective.filter((q) => answers.answers[q.qid]).length}/${objective.length} 个答案`);
         }
-        const unanswered = objective.filter((q) => !answers.answers[q.qid]);
+        let unanswered = objective.filter((q) => !answers.answers[q.qid]);
+        if (unanswered.length) {
+          // v1.7.2：只截取缺答案题号，避免整页 OCR 超时
+          const rescue = await this._tryFormulaRescue({ work, job, cx, engine, materialsText, emit, qids: unanswered.map((q) => String(q.qid)) });
+          if (rescue.ok) {
+            materialsText = rescue.materialsText;
+            const retry = await solveOnce(unanswered, `截图识别后补解 ${unanswered.length} 道客观题`);
+            if (retry && retry.answers) {
+              Object.assign(answers.answers, retry.answers);
+              if (retry.sources) sources.push(...retry.sources);
+              job.answers = answers;
+              this.jobs.save(job);
+            }
+            unanswered = objective.filter((q) => !answers.answers[q.qid]);
+          }
+        }
         if (unanswered.length) {
           const qids = unanswered.map((q) => q.qid);
           this._writeManualTemplate(job, qids);
-          return this._pauseJob(job, 'materials', `还有 ${unanswered.length} 道客观题未解出，已保留已得答案；可在 data\\materials\\${job.workId}\\manual-answers.json 手填后点“继续”重试`, qids, emit, {
+          const reason = job.formulaError
+            ? `公式/图片识别失败，仍有 ${unanswered.length} 道题无法读取`
+            : `还有 ${unanswered.length} 道客观题未解出，已保留已得答案；可在 data\\materials\\${job.workId}\\manual-answers.json 手填后点“继续”重试`;
+          return this._pauseJob(job, 'materials', reason, qids, emit, {
             missingQuestions: this._questionRefs(qids, job.questions),
           });
         }
-        await this._applyTargetAccuracy({ job, objective, answers, manualQids: Object.keys(manualAnswers), engine, emit });
+        await this._applyTargetAccuracy({
+          job,
+          objective: objectiveAll,
+          answers,
+          manualQids: Object.keys(manualAnswers),
+          skippedQids: [...skippedSet],
+          engine,
+          emit,
+          force: skippedSet.size > 0,
+        });
+      }
+
+      if (!objective.length && objectiveAll.length && skippedSet.size) {
+        await this._applyTargetAccuracy({
+          job,
+          objective: objectiveAll,
+          answers,
+          manualQids: Object.keys(manualAnswers),
+          skippedQids: [...skippedSet],
+          engine,
+          emit,
+          force: skippedSet.size > 0,
+        });
       }
 
       // 5. 简答题：逐题生成文字（已答过的题复用）
@@ -646,14 +754,34 @@ export class Orchestrator {
           const code = String((docResult && docResult.error && docResult.error.code) || '');
           if (!['LOOP_DETECTED', 'TIMEOUT', 'ENGINE_FAILED', 'EMPTY_CONTENT'].includes(code)) break;
         }
+        if (!docResult || docResult.ok === false || (docResult.needMaterials && docResult.needMaterials.length)) {
+          // v1.7.2：只重试有图片的题目；没有图片信息时退回全部题目
+          const docImageQids = job.questions.filter((q) => Number(q.imageCount) > 0 || q.latex).map((q) => String(q.qid));
+          const rescue = await this._tryFormulaRescue({ work, job, cx, engine, materialsText, emit, qids: docImageQids });
+          if (rescue.ok) {
+            materialsText = rescue.materialsText;
+            docResult = await engine.makeSubmissionDoc({
+              work,
+              questions: job.questions,
+              materials: materialsText,
+              templatePath: template,
+              outDir: path.join(jobDir, 'output'),
+              onEvent: (ev) => emit('engine', ev),
+            });
+          }
+        }
         if (!docResult || docResult.ok === false) {
           const err = (docResult && docResult.error) || {};
-          return this._pauseJob(job, 'materials', this._enginePauseReason('生成作业文件', err), [err.message || 'AI 未返回有效结果'], emit, {
+          const detail = [err.message || 'AI 未返回有效结果'];
+          if (job.formulaError) detail.push('公式截图识别：' + job.formulaError);
+          const reason = job.formulaError ? `公式/图片识别失败：${job.formulaError}` : this._enginePauseReason('生成作业文件', err);
+          return this._pauseJob(job, 'materials', reason, detail, emit, {
             missingQuestions: this._questionRefs(job.questions.map((q) => q.qid), job.questions),
           });
         }
         if (docResult.needMaterials && docResult.needMaterials.length) {
-          return this._pauseJob(job, 'materials', '缺少完成作业所需的资料', docResult.needMaterials, emit, {
+          const reason = job.formulaError ? `公式/图片识别失败：${job.formulaError}` : '缺少完成作业所需的资料';
+          return this._pauseJob(job, 'materials', reason, docResult.needMaterials, emit, {
             missingQuestions: this._questionRefs(job.questions.map((q) => q.qid), job.questions),
           });
         }
@@ -683,15 +811,28 @@ export class Orchestrator {
         finishStep('upload', '附件已上传');
       }
 
-      // 9. 提交 / 暂存 / 主观题审核暂停
+      // 9. 提交 / 暂存 / 主观题或正确率检查暂停
       const reviewBeforeSubmit = this.config.reviewBeforeSubmit !== false;
-      const mustSaveDraft = !this.config.autoSubmit || (this.config.autoSubmit && hasSubjective && reviewBeforeSubmit);
+      const accuracyChanges = job.accuracy && Array.isArray(job.accuracy.changed) ? job.accuracy.changed : [];
+      const skippedQuestions = Array.isArray(job.skippedQuestions) ? job.skippedQuestions : [];
+      const hasSkipped = skippedQuestions.length > 0;
+      const highAccuracyTies = job.highAccuracy && Array.isArray(job.highAccuracy.ties) ? job.highAccuracy.ties : [];
+      const needHighAccuracyReview = this.config.autoSubmit && highAccuracyTies.length > 0;
+      const needAccuracyReview = this.config.autoSubmit && accuracyChanges.length > 0;
+      const mustSaveDraft = !this.config.autoSubmit
+        || (this.config.autoSubmit && hasSubjective && reviewBeforeSubmit)
+        || needAccuracyReview
+        || (this.config.autoSubmit && hasSkipped)
+        || needHighAccuracyReview;
       const reviewQids = job.questions
         .filter((q) => {
           const t = String(q.type || '').toLowerCase();
           return SHORT_TYPES.has(t) || !OBJECTIVE_TYPES.has(t);
         })
         .map((q) => q.qid);
+      for (const c of accuracyChanges) if (!reviewQids.includes(String(c.qid))) reviewQids.push(String(c.qid));
+      for (const qid of skippedQuestions) if (!reviewQids.includes(String(qid))) reviewQids.push(String(qid));
+      for (const t of highAccuracyTies) if (!reviewQids.includes(String(t.qid))) reviewQids.push(String(t.qid));
 
       if (mustSaveDraft) {
         setPhase('save', '保存到学习通（暂存）');
@@ -706,18 +847,38 @@ export class Orchestrator {
         if (drafted && drafted.ok === false) throw new Error('暂存失败：' + JSON.stringify(drafted).slice(0, 400));
         finishStep('save', '已暂存到学习通');
 
-        if (this.config.autoSubmit && hasSubjective && reviewBeforeSubmit) {
+        if (this.config.autoSubmit && ((hasSubjective && reviewBeforeSubmit) || needAccuracyReview || hasSkipped || needHighAccuracyReview)) {
+          const reasonParts = [];
+          const detail = [];
+          if (hasSubjective && reviewBeforeSubmit) {
+            reasonParts.push('检测到主观题/附件题');
+            detail.push('若确认答案/附件无误，可点「仍然提交」由程序提交；');
+          }
+          if (needAccuracyReview) {
+            reasonParts.push(`目标正确率 ${Math.round((job.accuracy.target || 0) * 100)}%，已故意改错 ${accuracyChanges.length} 道题`);
+            detail.push('下方列出被故意改错的题（原 AI 答案 → 提交答案）；AI 原答案不保证正确；');
+          }
+          if (hasSkipped) {
+            reasonParts.push(`已跳过 ${skippedQuestions.length} 道题（留空）`);
+            detail.push('已跳过的主观题会留空（主观题不参与目标正确率改错）；提交前请手动确认这些题的完成情况，再决定是否提交。');
+          }
+          if (needHighAccuracyReview) {
+            reasonParts.push(`高正确率有 ${highAccuracyTies.length} 道题三次答案不同`);
+            detail.push('三次答案不同的题已随机选用一个，请人工复核下方三个答案后再提交。');
+          }
+          detail.push('也可点「打开作业页」在受控浏览器里检查，或点「仅保存，稍后手动提交」；');
+          detail.push('AI 生成内容可能有误，请以作业页面实际内容为准。');
           return this._pauseJob(
             job,
             'review',
-            '检测到主观题/附件题：已暂存到学习通，建议打开作业页检查后手动提交',
-            [
-              '若确认答案/附件无误，可点「仍然提交」由程序提交；',
-              '也可点「打开作业页」在受控浏览器里检查，或点「仅保存，稍后手动提交」；',
-              'AI 生成内容可能有误，请以作业页面实际内容为准。',
-            ],
+            reasonParts.join('；') + '：已暂存到学习通，请检查后手动提交',
+            detail,
             emit,
-            { reviewQuestions: this._questionRefs(reviewQids, job.questions) }
+            {
+              reviewQuestions: this._questionRefs(reviewQids, job.questions),
+              accuracyChanges,
+              highAccuracyTies,
+            }
           );
         }
 
@@ -728,10 +889,14 @@ export class Orchestrator {
           saved: true,
           at: new Date().toISOString(),
           note: '已暂存到学习通，等待手动提交',
+          accuracyChanged: accuracyChanges.length,
         };
         this.jobs.save(job);
         emit('job-done', { status: 'ready', result: job.result, files: job.files || [] });
         this.events.warn(`「${job.name}」已暂存，等待手动提交（学习通进度可能在提交后才更新）`);
+        if (accuracyChanges.length) {
+          this.events.warn(`「${job.name}」目标正确率设置下故意改错了 ${accuracyChanges.length} 道题，详情见作业详情。`);
+        }
         return { workId: job.workId, name: job.name, outcome: 'ready', result: job.result };
       }
 
@@ -800,24 +965,228 @@ export class Orchestrator {
     return out;
   }
 
-  async _applyTargetAccuracy({ job, objective, answers, manualQids, engine, emit }) {
+  /**
+   * v1.6：AI 因公式图片判“缺资料”时，截取受控作答页题目区域 → 视觉识别 → 追加资料并允许重试。
+   * 只截答题页，不截整个桌面；复杂公式不确定时通过 formula-warning 事件让 UI 弹窗提醒核对。
+   */
+  /** v1.7.2 高正确率：客观题 3 次求解，多数票；三次全不同则随机选并记录题号。 */
+  async _solveHighAccuracy({ solveOnce, questions }) {
+    const rounds = [];
+    for (let i = 1; i <= 3; i += 1) {
+      this.events.info(`高正确率：第 ${i}/3 次求解（客观题）…`);
+      try {
+        const r = await solveOnce(questions, `高正确率第 ${i}/3 次`);
+        rounds.push(r || {});
+      } catch (e) {
+        this.events.warn(`高正确率第 ${i}/3 次求解失败：${e.message}`);
+        rounds.push({});
+      }
+    }
+    const voteKey = (value) => {
+      if (Array.isArray(value)) {
+        return value.map((x) => String(x ?? '').trim().toUpperCase()).sort().join('|');
+      }
+      let s = String(value ?? '').trim();
+      if (/^(对|正确|true|√)$/i.test(s)) s = 'TRUE';
+      else if (/^(错|错误|false|×)$/i.test(s)) s = 'FALSE';
+      else s = s.toUpperCase();
+      return s;
+    };
+    const out = {};
+    const ties = [];
+    const sources = [];
+    const missing = [];
+    const indexMap = new Map((questions || []).map((q, i) => [String(q.qid), i + 1]));
+    for (const r of rounds) if (r && Array.isArray(r.sources)) sources.push(...r.sources);
+    for (const q of questions) {
+      const qid = String(q.qid);
+      const votes = [];
+      for (const r of rounds) {
+        const v = r && r.answers ? r.answers[qid] : undefined;
+        if (v == null) continue;
+        if (Array.isArray(v) ? !v.length : !String(v).trim()) continue;
+        votes.push(v);
+      }
+      if (!votes.length) { missing.push(qid); continue; }
+      const groups = new Map();
+      for (const v of votes) {
+        const k = voteKey(v);
+        if (!groups.has(k)) groups.set(k, { count: 0, value: v, values: [] });
+        const g = groups.get(k);
+        g.count += 1;
+        g.values.push(v);
+      }
+      const sorted = [...groups.values()].sort((a, b) => b.count - a.count);
+      let chosen;
+      if (sorted.length === 1) {
+        chosen = sorted[0].value;
+      } else if (sorted[0].count >= 2) {
+        chosen = sorted[0].value;
+      } else if (votes.length >= 3) {
+        // 三次全不同：随机选一个，并记录该题号与三个答案
+        const pick = votes[Math.floor(Math.random() * votes.length)];
+        chosen = pick;
+        ties.push({
+          qid,
+          index: indexMap.get(qid) || Number(q.index || 0),
+          type: String(q.type || ''),
+          answers: votes.slice(0, 3),
+          chosen,
+        });
+      } else {
+        chosen = votes[0];
+      }
+      out[qid] = chosen;
+    }
+    return { answers: out, ties, missing, sources, rounds: rounds.length };
+  }
+
+  async _tryFormulaRescue({ work, job, cx, engine, materialsText = '', emit, qids = [] }) {
+    if (job.formulaRescueAttempted) return { ok: false, reason: 'already-attempted' };
+    if (!cx || typeof cx.captureQuestionScreenshots !== 'function') return { ok: false, reason: 'screenshot-unsupported' };
+    if (!engine || typeof engine.ocrImages !== 'function') return { ok: false, reason: 'vision-unsupported' };
+    job.formulaRescueAttempted = true;
+    this.jobs.save(job);
+    const jobDir = path.join(DIRS.jobs, job.workId);
+    const shotDir = path.join(jobDir, 'screenshots');
+    const targetQids = [...new Set((qids || []).map(String).filter(Boolean))];
+    try {
+      this.events.info(`「${job.name}」正在按题号截取作答页并做视觉识别${targetQids.length ? `（${targetQids.join(',')}）` : ''}…`);
+      const shots = await cx.captureQuestionScreenshots(work, shotDir, { qids: targetQids });
+      if (!shots || !shots.length) {
+        job.formulaError = '没有截取到作答页截图';
+        this.jobs.save(job);
+        return { ok: false, reason: 'no-screenshots' };
+      }
+      job.formulaScreenshots = shots.map((s) => (typeof s === 'string' ? s : s.path)).filter(Boolean);
+      this.jobs.save(job);
+      const texts = [];
+      const errors = [];
+      // 每题单独 OCR；单题超时/失败不拖垮其他题；失败再降分辨率重试一次
+      for (const file of job.formulaScreenshots) {
+        const name = path.basename(file);
+        let r = await engine.ocrImages({
+          files: [file],
+          cacheDir: path.join(DIRS.data, 'ocr-cache'),
+          prompt: FORMULA_OCR_PROMPT,
+          timeoutMs: 120000,
+          maxPixels: 2000,
+          onEvent: (ev) => { if (emit) emit('vision', ev); },
+        });
+        if (!r || !r.texts || !r.texts.length) {
+          this.events.warn(`「${job.name}」${name} 识别超时/失败，降低分辨率重试…`);
+          r = await engine.ocrImages({
+            files: [file],
+            cacheDir: path.join(DIRS.data, 'ocr-cache'),
+            prompt: FORMULA_OCR_PROMPT,
+            timeoutMs: 120000,
+            maxPixels: 1200,
+            onEvent: (ev) => { if (emit) emit('vision', ev); },
+          });
+        }
+        if (r && r.texts && r.texts.length) texts.push(...r.texts);
+        if (r && r.errors) errors.push(...r.errors);
+      }
+      let joined = texts.map((t) => String(t.text || '').trim()).filter(Boolean).join('\n\n');
+      const uncertain = joined.includes(FORMULA_UNCERTAIN_MARKER);
+      joined = joined.split(FORMULA_UNCERTAIN_MARKER).join('').trim();
+      if (!joined) {
+        job.formulaError = (errors[0] && (errors[0].error || errors[0].message)) || '截图识别没有产出文字';
+        this.jobs.save(job);
+        this.events.warn(`「${job.name}」作答页截图识别失败：${job.formulaError}`);
+        return { ok: false, reason: 'ocr-empty', error: job.formulaError };
+      }
+      const ocrBlock = `【作业页面截图 OCR（按题号自动识别，仅供参考）】\n${joined.slice(0, 30000)}`;
+      job.formulaOcr = joined.slice(0, 4000);
+      if (errors.length) job.formulaError = errors.map((e) => e.error).filter(Boolean).join('；').slice(0, 500);
+      if (uncertain) {
+        job.formulaWarning = {
+          text: joined.slice(0, 4000),
+          screenshots: job.formulaScreenshots,
+          at: new Date().toISOString(),
+        };
+        this.events.warn(`「${job.name}」检测到复杂/不确定公式，已提示用户比对原题`);
+        if (emit) {
+          emit('formula-warning', {
+            workId: job.workId,
+            name: job.name,
+            text: joined.slice(0, 4000),
+            screenshots: job.formulaScreenshots,
+            reason: '复杂公式识别可能不准确，请比对原题目',
+          });
+        }
+      }
+      this.jobs.save(job);
+      this.events.info(`「${job.name}」截图识别完成：${joined.length} 字${uncertain ? '（含不确定公式）' : ''}`);
+      return {
+        ok: true,
+        materialsText: `${materialsText}${materialsText ? '\n\n' : ''}${ocrBlock}`,
+        ocrText: joined,
+        uncertain,
+        screenshots: job.formulaScreenshots,
+        failedCount: errors.length,
+      };
+    } catch (e) {
+      job.formulaError = e.message;
+      this.jobs.save(job);
+      this.events.warn(`「${job.name}」公式截图识别异常：${e.message}`);
+      return { ok: false, reason: 'exception', error: e.message };
+    }
+  }
+
+  async _applyTargetAccuracy({ job, objective, answers, manualQids, skippedQids = [], engine, emit, force = false }) {
     const target = accuracy.normalizeTargetAccuracy(this.config.targetAccuracy);
-    if (target >= 0.99 || !objective.length) return null;
-    if (job.accuracy && job.accuracy.applied) return job.accuracy;
-    const plan = accuracy.planTargetAccuracy({
-      questions: job.questions,
-      answers,
-      excludeQids: manualQids,
-      target,
-      seed: job.workId,
-    });
-    const blankSelected = plan.selected.filter((x) => x.kind === 'blank');
+    const objectiveAll = Array.isArray(objective) ? objective : job.questions.filter((q) => OBJECTIVE_TYPES.has(String(q.type || '').toLowerCase()));
+    if (!objectiveAll.length) return null;
+    const forceEffective = force || Boolean(job.accuracy && job.accuracy.applied && Number(job.accuracy.target) !== Number(target));
+    if (job.accuracy && job.accuracy.applied && !forceEffective) return job.accuracy;
+    const manualSet = new Set((manualQids || []).map(String));
+    const skipSet = new Set((job.skippedQuestions || skippedQids || []).map(String));
+    const skippedObjectiveCount = objectiveAll.filter((q) => skipSet.has(String(q.qid))).length;
+    const map = answers && answers.answers ? answers.answers : answers || {};
+    const originalAnswers = { ...((job.accuracy && job.accuracy.originalAnswers) || {}) };
+
+    // 重新计算（例如跳过题目）时，先把之前故意改错的答案恢复，再按新题数重新改错
+    if (forceEffective && job.accuracy && Array.isArray(job.accuracy.changed)) {
+      for (const c of job.accuracy.changed) {
+        const before = c.before != null ? c.before : originalAnswers[c.qid];
+        if (before != null) map[c.qid] = before;
+      }
+    }
+    for (const q of objectiveAll) {
+      const qid = String(q.qid);
+      if (skipSet.has(qid)) { delete map[qid]; continue; }
+      if (originalAnswers[qid] === undefined && map[qid] != null) originalAnswers[qid] = map[qid];
+    }
+
+    const total = objectiveAll.filter((q) => !manualSet.has(String(q.qid))).length;
+    const indexMap = new Map((job.questions || []).map((q, i) => [String(q.qid), i + 1]));
+    const desiredWrong = target >= 0.99 ? 0 : Math.min(total, Math.max(1, Math.round(total * (1 - target))));
+    const extraWrong = Math.max(0, desiredWrong - skippedObjectiveCount);
+    const candidates = objectiveAll
+      .filter((q) => {
+        const qid = String(q.qid);
+        if (skipSet.has(qid) || manualSet.has(qid)) return false;
+        return map[qid] != null && (Array.isArray(map[qid]) ? map[qid].length > 0 : String(map[qid]).trim() !== '');
+      })
+      .slice()
+      .sort((a, b) => (indexMap.get(String(a.qid)) || 0) - (indexMap.get(String(b.qid)) || 0));
+    const selected = candidates.slice(0, extraWrong).map((q) => ({
+      index: indexMap.get(String(q.qid)) || Number(q.index || 0),
+      qid: String(q.qid),
+      type: String(q.type || ''),
+      stem: String(q.stem || ''),
+      answer: map[String(q.qid)],
+      kind: String(q.type || '').toLowerCase() === 'blank' ? 'blank' : 'choice',
+    }));
+    const plan = { target, eligibleCount: total, wrongCount: desiredWrong, selected };
+    const blankSelected = selected.filter((x) => x.kind === 'blank');
     const blankWrong = {};
     if (blankSelected.length && engine && typeof engine.makeWrongAnswers === 'function') {
       try {
         const wr = await engine.makeWrongAnswers({
           work: { workId: job.workId, name: job.name },
-          questions: blankSelected.map((x) => objective.find((q) => String(q.qid) === x.qid) || { qid: x.qid }),
+          questions: blankSelected.map((x) => objectiveAll.find((q) => String(q.qid) === x.qid) || { qid: x.qid }),
           correctAnswers: answers.answers,
           cwd: path.join(DIRS.jobs, job.workId, 'engine-wrong'),
           onEvent: (ev) => emit('engine', ev),
@@ -828,30 +1197,102 @@ export class Orchestrator {
         this.events.warn(`填空题错误答案生成异常，将使用兜底错误答案：${e.message}`);
       }
     }
-    const applied = accuracy.applyTargetAccuracyFor({ plan, answers, questions: job.questions, blankWrong });
+    const applied = accuracy.applyTargetAccuracyFor({ plan, answers, questions: objectiveAll, blankWrong });
     job.answers = answers;
     job.accuracy = {
       target,
-      eligibleCount: plan.eligibleCount,
-      intendedWrong: plan.wrongCount,
-      changed: applied.changed.map((x) => ({ qid: x.qid, index: x.index, type: x.type })),
+      eligibleCount: total,
+      intendedWrong: desiredWrong,
+      skippedCount: skippedObjectiveCount,
+      changed: applied.changed.map((x) => ({
+        qid: x.qid,
+        index: x.index,
+        type: x.type,
+        kind: x.kind,
+        before: x.before,
+        after: x.after,
+      })),
       failed: applied.failed,
+      originalAnswers,
       applied: true,
       at: new Date().toISOString(),
     };
     this.jobs.save(job);
     const pct = Math.round(target * 100);
+    if (skippedObjectiveCount) {
+      this.events.warn(`已跳过 ${skippedObjectiveCount} 道客观题（留空，计入错误）；目标错误数 ${desiredWrong}，另改错 ${applied.changed.length} 道。`);
+      if (skippedObjectiveCount > desiredWrong) this.events.warn(`跳过题数已超过目标错误数，实际正确率会低于 ${pct}%。`);
+    }
     if (applied.changed.length) {
       const note = `已按目标正确率 ${pct}% 调整 ${applied.changed.length} 道客观题（第 ${applied.changed.map((x) => x.index).join('、')} 题）；实际正确率受 AI 能力影响，无法保证。`;
       this.events.warn(note);
-      emit('accuracy', { target, changed: job.accuracy.changed, note });
-    } else {
+      emit('accuracy', { target, changed: job.accuracy.changed, skippedCount: skippedObjectiveCount, note });
+    } else if (!skippedObjectiveCount) {
       this.events.warn(`目标正确率 ${pct}%，但没有可调整的客观题（或题目数量太少）。`);
     }
     if (target <= 0.3) {
       this.events.warn('当前为 30% 档位：会产生大量故意错误答案，容易影响成绩/引起注意，请谨慎使用。');
     }
     return job.accuracy;
+  }
+
+  /** 跳过某道客观题：留空、计入正确率；提交时 UI 会提示手动确认。 */
+  async skipQuestion(workId, qid) {
+    if (this.running) throw new Error('队列仍在运行，请等运行结束或先停止后再跳过题目');
+    const job = this.jobs.get(String(workId));
+    if (!job) throw new Error('找不到该作业记录');
+    const question = (job.questions || []).find((q) => String(q.qid) === String(qid));
+    if (!question) throw new Error('找不到该题目');
+    if (!SHORT_TYPES.has(String(question.type || '').toLowerCase())) throw new Error('只能跳过简答/论述等主观题');
+    job.skippedQuestions = Array.isArray(job.skippedQuestions) ? job.skippedQuestions : [];
+    if (job.skippedQuestions.includes(String(qid))) return { ok: true, skippedQuestions: job.skippedQuestions, already: true };
+    job.skippedQuestions.push(String(qid));
+    job.answers = job.answers || { answers: {} };
+    job.answers.answers = job.answers.answers || {};
+    const originalValue = job.answers.answers[String(qid)];
+    job.accuracy = job.accuracy || { target: this.config.targetAccuracy, originalAnswers: {} };
+    job.accuracy.originalAnswers = job.accuracy.originalAnswers || {};
+    if (originalValue != null) job.accuracy.originalAnswers[String(qid)] = originalValue;
+    delete job.answers.answers[String(qid)];
+    if (job.status === 'paused') {
+      job.paused = job.paused || {};
+      job.paused.reason = `已跳过 ${job.skippedQuestions.length} 道题（留空）；提交前请手动确认完成情况`;
+      job.paused.skippedQuestions = job.skippedQuestions;
+    }
+    this.jobs.save(job);
+    const qIndex = (job.questions || []).findIndex((q) => String(q.qid) === String(qid)) + 1;
+    this.events.warn(`「${job.name}」已跳过第 ${qIndex || question.index || '?'} 题（${qid}），该题为主观题，会留空；提交前请手动确认。`);
+    try {
+      const engine = await this._loadEngine();
+      const objectiveAll = (job.questions || []).filter((q) => OBJECTIVE_TYPES.has(String(q.type || '').toLowerCase()));
+      await this._applyTargetAccuracy({
+        job,
+        objective: objectiveAll,
+        answers: job.answers,
+        manualQids: [],
+        skippedQids: job.skippedQuestions,
+        engine,
+        emit: (type, data) => this.events.broadcast(type, data),
+        force: true,
+      });
+    } catch (e) {
+      this.events.warn(`跳过题目后重新计算正确率失败：${e.message}`);
+    }
+    if (job.paused) {
+      job.paused.skippedQuestions = job.skippedQuestions;
+      job.paused.accuracyChanges = job.accuracy && Array.isArray(job.accuracy.changed) ? job.accuracy.changed : [];
+      job.paused.reason = `已跳过 ${job.skippedQuestions.length} 道题（留空）；提交前请手动确认完成情况`;
+    }
+    this.jobs.save(job);
+    const payload = {
+      workId: job.workId,
+      qid: String(qid),
+      skippedQuestions: job.skippedQuestions,
+      accuracy: job.accuracy || null,
+      reason: '该题已留空，提交前需要手动确认完成情况',
+    };
+    this.events.broadcast('job-skip', payload);
+    return { ok: true, ...payload };
   }
 
   _pauseJob(job, kind, reason, detail, emit, extra = {}) {
@@ -863,6 +1304,13 @@ export class Orchestrator {
       detail,
       missingQuestions: Array.isArray(extra.missingQuestions) ? extra.missingQuestions : [],
       reviewQuestions: Array.isArray(extra.reviewQuestions) ? extra.reviewQuestions : [],
+      accuracyChanges: Array.isArray(extra.accuracyChanges) ? extra.accuracyChanges : [],
+      skippedQuestions: Array.isArray(job.skippedQuestions) ? job.skippedQuestions : [],
+      highAccuracyTies: Array.isArray(extra.highAccuracyTies) ? extra.highAccuracyTies : [],
+      skippableQuestions: this._questionRefs(
+        (job.questions || []).filter((q) => SHORT_TYPES.has(String(q.type || '').toLowerCase())).map((q) => q.qid),
+        job.questions
+      ),
       materialsDir: path.join(DIRS.materials, job.workId),
       at: new Date().toISOString(),
     };
@@ -873,9 +1321,44 @@ export class Orchestrator {
       detail,
       missingQuestions: job.paused.missingQuestions,
       reviewQuestions: job.paused.reviewQuestions,
+      accuracyChanges: job.paused.accuracyChanges,
+      skippedQuestions: job.paused.skippedQuestions,
+      skippableQuestions: job.paused.skippableQuestions,
+      highAccuracyTies: job.paused.highAccuracyTies,
     });
     this.events.warn(`「${job.name}」已暂停：${reason}${detail ? '（' + JSON.stringify(detail).slice(0, 200) + '）' : ''}`);
     return { workId: job.workId, name: job.name, outcome: 'paused', reason, detail };
+  }
+
+  /** 手动“再次识别”（AI 截图视觉识别）：重新截取受控作答页题目区域并 OCR。 */
+  async rescueJob(workId) {
+    if (this.running) throw new Error('队列仍在运行，请等运行结束或先停止后再手动识别');
+    const job = this.jobs.get(String(workId));
+    if (!job) throw new Error('找不到该作业记录');
+    const cx = await this._loadCx();
+    const engine = await this._loadEngine();
+    const work = this.findWork(workId) || {
+      workId: job.workId, courseId: job.courseId, courseName: job.courseName,
+      name: job.name, kind: job.kind, status: job.status, url: job.url,
+    };
+    job.formulaRescueAttempted = false;
+    this.jobs.save(job);
+    this.events.info(`「${job.name}」正在手动重新截图识别（AI 视觉）…`);
+    const imageQids = (job.questions || []).filter((q) => Number(q.imageCount) > 0 || q.latex).map((q) => String(q.qid));
+    const r = await this._tryFormulaRescue({
+      work,
+      job,
+      cx,
+      engine,
+      materialsText: '',
+      emit: (type, data) => this.events.broadcast(type, data),
+      qids: imageQids,
+    });
+    if (!r.ok) throw new Error(r.error || '截图识别失败');
+    job.formulaOcr = r.ocrText;
+    this.jobs.save(job);
+    this.events.info(`「${job.name}」重新识别完成：${r.ocrText.length} 字`);
+    return { ok: true, text: r.ocrText, uncertain: Boolean(r.uncertain), screenshots: r.screenshots || [] };
   }
 
   /** 审核暂停后：打开作业页（受控 Edge），供用户检查。 */
@@ -903,7 +1386,10 @@ export class Orchestrator {
       name: job.name, kind: job.kind, status: job.status, url: job.url,
     };
     try {
-      const sub = await cx.submitAnswers(work, job.answers || { answers: {} });
+      // 跳过题在提交前显式写空，避免学习通页面残留暂存答案
+      const submitMap = { ...((job.answers && job.answers.answers) || {}) };
+      for (const qid of (job.skippedQuestions || [])) submitMap[String(qid)] = '';
+      const sub = await cx.submitAnswers(work, { ...(job.answers || {}), answers: submitMap });
       if (sub && sub.ok === false) throw new Error('提交失败：' + JSON.stringify(sub).slice(0, 400));
       job.result = { submitted: true, at: new Date().toISOString(), raw: sub && sub.raw ? String(JSON.stringify(sub.raw)).slice(0, 500) : '' };
       job.status = 'done';

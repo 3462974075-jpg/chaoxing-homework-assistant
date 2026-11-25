@@ -1,5 +1,5 @@
 @echo off
-rem Chaoxing Homework Assistant v1.5.0
+rem Chaoxing Homework Assistant v1.7.2
 rem Copyright (c) 2026 sevenplayer (Lsy). All rights reserved.
 rem SPDX-License-Identifier: MIT
 rem Powered by DeepSeek (AI-assisted development)

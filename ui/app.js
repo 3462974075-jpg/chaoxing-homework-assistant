@@ -1,5 +1,5 @@
 /**
- * 学习通作业助手 (Chaoxing Homework Assistant) v1.5.0
+ * 学习通作业助手 (Chaoxing Homework Assistant) v1.7.2
  * Copyright (c) 2026 七号玩家 (sevenplayer / Lsy). All rights reserved.
  * SPDX-License-Identifier: MIT
  * Powered by DeepSeek（AI 辅助开发）
@@ -42,7 +42,7 @@
     submit: '提交', paused: '暂停', done: '完成'
   };
 
-  var DEFAULTS = { autoSubmit: true, targetAccuracy: 0.99, reviewBeforeSubmit: true, model: 'deepseek-chat', port: 8765, concurrency: 1, timeoutMin: 10 };
+  var DEFAULTS = { autoSubmit: true, targetAccuracy: 0.99, highAccuracy: false, reviewBeforeSubmit: true, model: 'deepseek-chat', port: 8765, concurrency: 1, timeoutMin: 10 };
 
   var CLEAR_FALLBACK = [
     { scope: 'session', label: '登录 Cookie', desc: '清除后需要重新登录学习通。' },
@@ -412,7 +412,7 @@
     };
 
     ['job-start', 'step', 'job-done', 'job-paused', 'job-resumed', 'run-start', 'run-done',
-      'run-paused', 'run-resumed', 'run-stopped', 'log', 'need-human', 'login-done',
+      'run-paused', 'run-resumed', 'run-stopped', 'log', 'need-human', 'login-done', 'formula-warning', 'job-skip',
       'privacy-cleared', 'install-progress', 'install-done'].forEach(function (name) {
       es.addEventListener(name, function (ev) {
         S.sse.lastMsg = Date.now();
@@ -473,6 +473,8 @@
       case 'run-done': onRunDone(ev); break;
       case 'need-human': onNeedHuman(ev); break;
       case 'login-done': onLoginDone(ev); break;
+    case 'formula-warning': onFormulaWarning(ev); break;
+    case 'job-skip': onJobSkip(ev); break;
       case 'privacy-cleared': onPrivacyCleared(ev); break;
       default: break; // 未知事件静默忽略
     }
@@ -583,10 +585,41 @@
       detail: ev.detail,
       missingQuestions: ev.missingQuestions,
       reviewQuestions: ev.reviewQuestions,
+      accuracyChanges: ev.accuracyChanges,
+      skippedQuestions: ev.skippedQuestions,
+      skippableQuestions: ev.skippableQuestions,
+      highAccuracyTies: ev.highAccuracyTies,
       createdAt: ev.ts || Date.now()
     });
     S.run.paused.set(ev.workId, p);
     addLog('warn', '已暂停：' + (job.name || ev.workId) + '（' + p.reason + '）', ev.workId);
+    renderRun();
+  }
+
+  function onFormulaWarning(ev) {
+    addLog('warn', '公式识别提醒：' + (ev.name || ev.workId || '') + '（识别结果可能不准确，请比对原题）', ev.workId);
+    var body = el('div', {},
+      el('p', {}, 'AI 从作答页截图里识别到公式，但可能存在误差。请对照原题目检查；识别结果已自动用于本次作答，不会替代你的最终判断。'),
+      ev.reason ? el('p', { class: 'callout callout-warn' }, ev.reason) : null,
+      ev.text ? el('pre', { class: 'answer-box mono small', style: 'white-space:pre-wrap;word-break:break-word;max-height:260px;overflow:auto;margin-top:8px' }, String(ev.text)) : null,
+      Array.isArray(ev.screenshots) && ev.screenshots.length
+        ? el('div', { class: 'small muted', style: 'margin-top:8px' }, '截图：' + ev.screenshots.map(function (p) { return String(p).split(/[\\/]/).pop(); }).join('、'))
+        : null
+    );
+    openModal({ title: '公式识别提醒 · 请比对原题', body: body, footer: rescueControl({ workId: ev.workId, name: ev.name }) });
+  }
+
+  function onJobSkip(ev) {
+    var job = ensureJob(ev.workId, ev);
+    if (Array.isArray(ev.skippedQuestions)) job.skippedQuestions = ev.skippedQuestions;
+    if (ev.accuracy) job.accuracy = ev.accuracy;
+    var p = S.run.paused.get(ev.workId);
+    if (p) {
+      p.skippedQuestions = Array.isArray(ev.skippedQuestions) ? ev.skippedQuestions : p.skippedQuestions;
+      if (ev.accuracy && Array.isArray(ev.accuracy.changed)) p.accuracyChanges = ev.accuracy.changed;
+      p.reason = ev.reason || p.reason;
+    }
+    addLog('warn', '已跳过一道主观题（留空）：' + (job.name || ev.workId) + '，提交前请手动确认完成情况', ev.workId);
     renderRun();
   }
 
@@ -867,6 +900,10 @@
       detail: p.detail || null,
       missingQuestions: Array.isArray(p.missingQuestions) ? p.missingQuestions : [],
       reviewQuestions: Array.isArray(p.reviewQuestions) ? p.reviewQuestions : [],
+      accuracyChanges: Array.isArray(p.accuracyChanges) ? p.accuracyChanges : [],
+      skippedQuestions: Array.isArray(p.skippedQuestions) ? p.skippedQuestions : [],
+      skippableQuestions: Array.isArray(p.skippableQuestions) ? p.skippableQuestions : [],
+      highAccuracyTies: Array.isArray(p.highAccuracyTies) ? p.highAccuracyTies : [],
       createdAt: p.createdAt || p.ts || Date.now()
     };
   }
@@ -1691,6 +1728,129 @@
     return box;
   }
 
+  function accuracyChangesBlock(changes) {
+    if (!Array.isArray(changes) || !changes.length) return null;
+    var box = el('div', { class: 'detail-section', style: 'margin-top:8px' },
+      el('h4', {}, '目标正确率改错明细（原 AI 答案 → 提交答案）')
+    );
+    var list = el('div', { class: 'stack' });
+    changes.slice(0, 30).forEach(function (c) {
+      var before = Array.isArray(c.before) ? c.before.join(' / ') : String(c.before == null ? '' : c.before);
+      var after = Array.isArray(c.after) ? c.after.join(' / ') : String(c.after == null ? '' : c.after);
+      list.appendChild(el('div', { class: 'small', style: 'padding:4px 0;border-bottom:1px solid var(--line)' },
+        el('span', { class: 'chip chip-gray', style: 'margin-right:6px' }, '第' + (c.index || '?') + '题'),
+        el('span', { class: 'muted' }, (c.type || '') + ' · '),
+        el('span', {}, '原 AI：' + (before || '（空）') + ' → 提交：' + (after || '（空）'))
+      ));
+    });
+    if (changes.length > 30) list.appendChild(el('div', { class: 'small faint' }, '仅展示前 30 条，共 ' + changes.length + ' 条。'));
+    box.appendChild(list);
+    box.appendChild(el('div', { class: 'small muted', style: 'margin-top:4px' }, '“原 AI 答案”不保证正确，仅表示被故意改动的题；请以原题核对为准。'));
+    return box;
+  }
+
+  function rescueControl(p) {
+    var btn = el('button', { class: 'btn btn-sm', type: 'button' }, '再次识别（AI 截图视觉识别）');
+    btn.addEventListener('click', async function () {
+      if (S.run.active) { toast('当前队列仍在运行，请等作业暂停或运行结束后再点「再次识别」', 'warn'); return; }
+      setBtnBusy(btn, true);
+      try {
+        var r = await api('/api/jobs/' + encodeURIComponent(p.workId) + '/rescue', { method: 'POST', body: {}, timeout: 180000 });
+        var body = el('div', {},
+          el('p', {}, '这是 AI 对受控作答页截图的视觉识别结果，仅供参考，请比对原题目。'),
+          el('pre', { class: 'answer-box mono small', style: 'white-space:pre-wrap;word-break:break-word;max-height:300px;overflow:auto;margin-top:8px' }, String(r.text || '（未识别到文字）')),
+          r.uncertain ? el('div', { class: 'callout callout-warn', style: 'margin-top:8px' }, '识别结果包含复杂/不确定公式，请务必人工核对。') : null
+        );
+        openModal({
+          title: '再次识别结果 · AI 截图视觉识别',
+          body: body,
+          footer: el('div', {},
+            el('button', { class: 'btn', type: 'button', onclick: function () { var m = document.querySelector('.modal'); if (m) m.remove(); var root = $('#modal-root'); if (root) { root.hidden = true; clearNode(root); } } }, '关闭')
+          )
+        });
+        toast('已完成截图识别，请查看识别结果', r.uncertain ? 'warn' : 'ok');
+      } catch (err) { toast('再次识别失败：' + errMsg(err), 'error'); }
+      finally { setBtnBusy(btn, false); }
+    });
+    return btn;
+  }
+
+  function skipControl(p) {
+    var refs = Array.isArray(p.skippableQuestions) && p.skippableQuestions.length
+      ? p.skippableQuestions
+      : (Array.isArray(p.reviewQuestions) && p.reviewQuestions.length ? p.reviewQuestions : (Array.isArray(p.missingQuestions) ? p.missingQuestions : []));
+    var skipped = Array.isArray(p.skippedQuestions) ? p.skippedQuestions.map(String) : [];
+    var subjTypes = ['short', 'essay', 'subjective', 'answer'];
+    var available = refs.filter(function (r) {
+      return r && r.qid && subjTypes.indexOf(String(r.type || '').toLowerCase()) >= 0 && skipped.indexOf(String(r.qid)) < 0;
+    });
+    var box = el('div', { class: 'detail-section', style: 'margin-top:8px' },
+      el('h4', {}, '识别不了？可跳过主观题（留空）')
+    );
+    if (!available.length) {
+      box.appendChild(el('div', { class: 'small muted' }, '当前没有可跳过的题目。'));
+      return box;
+    }
+    if (skipped.length) {
+      box.appendChild(el('div', { class: 'small', style: 'color:var(--orange);margin-bottom:4px' }, '已跳过 ' + skipped.length + ' 题（留空，提交前需手动确认完成情况）。'));
+    }
+    var sel = el('select', { class: 'input btn-sm', style: 'max-width:520px' });
+    available.forEach(function (r) {
+      sel.appendChild(el('option', { value: r.qid },
+        r.stem
+          ? '第' + (r.index || '?') + '题 · ' + (r.typeLabel || r.type || '未知') + ' · ' + String(r.stem).slice(0, 60)
+          : '第' + (r.index || '?') + '题'));
+    });
+    var btn = el('button', { class: 'btn btn-sm', type: 'button' }, '跳过本题');
+    btn.addEventListener('click', async function () {
+      var qid = sel.value;
+      if (!qid) return;
+      var ok = await confirmDialog({
+        title: '确认跳过这道题',
+        body: el('div', {},
+          el('p', {}, '跳过会把该主观题留空、不填答案；主观题不受目标正确率改错逻辑影响。'),
+          el('p', { class: 'callout callout-warn' }, '提交前会要求你手动确认完成情况；请自行确认空题是否会影响成绩。')
+        ),
+        okText: '跳过本题', danger: true
+      });
+      if (!ok) return;
+      setBtnBusy(btn, true);
+      try {
+        var r = await api('/api/jobs/' + encodeURIComponent(p.workId) + '/skip', { method: 'POST', body: { qid: qid }, timeout: 180000 });
+        p.skippedQuestions = r.skippedQuestions || p.skippedQuestions;
+        if (r.accuracy) p.accuracyChanges = r.accuracy.changed || [];
+        toast('已跳过该题（留空），提交前请手动确认完成情况', 'warn');
+        renderRun();
+      } catch (err) { toast('跳过失败：' + errMsg(err), 'error'); }
+      finally { setBtnBusy(btn, false); }
+    });
+    box.appendChild(el('div', { style: 'display:flex;gap:8px;align-items:center;flex-wrap:wrap' }, sel, btn));
+    box.appendChild(el('div', { class: 'small muted', style: 'margin-top:4px' }, '主观题跳过只留空；提交前会提示你手动确认完成情况。'));
+    return box;
+  }
+
+  function highAccuracyTiesBlock(ties) {
+    if (!Array.isArray(ties) || !ties.length) return null;
+    var box = el('div', { class: 'detail-section', style: 'margin-top:8px' },
+      el('h4', {}, '高正确率：三次答案不同的题（已随机选用，请人工复核）')
+    );
+    var list = el('div', { class: 'stack' });
+    ties.slice(0, 30).forEach(function (t) {
+      var answers = Array.isArray(t.answers) ? t.answers.map(function (a) {
+        return Array.isArray(a) ? a.join(' / ') : String(a == null ? '' : a);
+      }).join('  ｜  ') : '';
+      list.appendChild(el('div', { class: 'small', style: 'padding:4px 0;border-bottom:1px solid var(--line)' },
+        el('span', { class: 'chip chip-gray', style: 'margin-right:6px' }, '第' + (t.index || '?') + '题'),
+        el('span', { class: 'muted' }, (t.type || '') + ' · 三次：'),
+        el('span', {}, answers),
+        el('div', { class: 'small', style: 'color:var(--orange)' }, '随机采用：' + (Array.isArray(t.chosen) ? t.chosen.join(' / ') : String(t.chosen == null ? '' : t.chosen)))
+      ));
+    });
+    box.appendChild(list);
+    box.appendChild(el('div', { class: 'small muted', style: 'margin-top:4px' }, '三次全不同说明模型不稳定；请对照原题复核后再提交。'));
+    return box;
+  }
+
   function pausedCard(p) {
     var isHuman = p.kind === 'human';
     var isReview = p.kind === 'review';
@@ -1740,6 +1900,12 @@
       ));
       var refs = questionRefsBlock(p.reviewQuestions);
       if (refs) card.appendChild(refs);
+      var accBox = accuracyChangesBlock(p.accuracyChanges);
+      if (accBox) card.appendChild(accBox);
+      var tieBox = highAccuracyTiesBlock(p.highAccuracyTies);
+      if (tieBox) card.appendChild(tieBox);
+      card.appendChild(el('div', { class: 'pause-actions', style: 'margin-top:8px' }, rescueControl(p)));
+      card.appendChild(skipControl(p));
       var openBtn = el('button', {
         class: 'btn btn-sm', type: 'button',
         onclick: async function (e) {
@@ -1770,6 +1936,12 @@
             title: '确认提交作业',
             body: el('div', {},
               el('p', {}, '请确认已在作业页检查过答案与附件，且确认 AI 生成内容无误。'),
+              Array.isArray(p.skippedQuestions) && p.skippedQuestions.length
+                ? el('p', { class: 'callout callout-danger' }, '已跳过 ' + p.skippedQuestions.length + ' 道题并留空，请手动确认这些题的完成情况/是否会影响成绩；确认无误后再提交。')
+                : null,
+              Array.isArray(p.highAccuracyTies) && p.highAccuracyTies.length
+                ? el('p', { class: 'callout callout-danger' }, '高正确率有 ' + p.highAccuracyTies.length + ' 道题三次答案全不同，已随机选用；请复核这三个答案后再提交。')
+                : null,
               el('p', { class: 'callout callout-danger' }, '提交后会消耗作答机会，通常不可撤回。')
             ),
             okText: '确认提交', danger: true
@@ -1797,6 +1969,8 @@
     if (detailText) card.appendChild(el('div', { class: 'small muted', style: 'margin-top:6px' }, '缺少：' + detailText));
     var refsBox = questionRefsBlock(p.missingQuestions);
     if (refsBox) card.appendChild(refsBox);
+    card.appendChild(el('div', { class: 'pause-actions', style: 'margin-top:8px' }, rescueControl(p)));
+    card.appendChild(skipControl(p));
     card.appendChild(el('div', { class: 'callout callout-warn', style: 'margin-top:8px' },
       el('div', { class: 'callout-body' }, 'AI 定位的题号/缺资料判断不一定准确，请以作业页面为准，自行读题后补充；提供错误资料可能导致答案错误。')
     ));
@@ -1917,6 +2091,29 @@
       ));
     }
 
+    if (j.formulaWarning) {
+      box.appendChild(el('div', { class: 'callout callout-warn', style: 'margin-top:12px' },
+        el('div', { class: 'callout-body' },
+          el('div', { style: 'font-weight:700' }, '公式截图识别提醒'),
+          el('div', { class: 'small' }, '复杂/不确定公式可能识别不准确，请比对原题目。'),
+          j.formulaWarning.text ? el('pre', { class: 'answer-box mono small', style: 'white-space:pre-wrap;word-break:break-word;max-height:200px;overflow:auto;margin-top:6px' }, String(j.formulaWarning.text).slice(0, 4000)) : null
+        )
+      ));
+    }
+
+    if (Array.isArray(j.skippedQuestions) && j.skippedQuestions.length) {
+      box.appendChild(el('div', { class: 'callout callout-warn', style: 'margin-top:12px' },
+        el('div', { class: 'callout-body' }, '已跳过 ' + j.skippedQuestions.length + ' 道题（留空）；提交前请手动确认完成情况，空题可能影响成绩。')
+      ));
+    }
+
+    if (j.accuracy && Array.isArray(j.accuracy.changed) && j.accuracy.changed.length) {
+      box.appendChild(accuracyChangesBlock(j.accuracy.changed));
+    }
+    if (j.highAccuracy && Array.isArray(j.highAccuracy.ties) && j.highAccuracy.ties.length) {
+      box.appendChild(highAccuracyTiesBlock(j.highAccuracy.ties));
+    }
+
     if (Array.isArray(j.steps) && j.steps.length) {
       var tl = el('div', { class: 'steps-timeline' });
       j.steps.forEach(function (s) {
@@ -2020,6 +2217,7 @@
     return {
       autoSubmit: s.autoSubmit !== undefined ? !!s.autoSubmit : DEFAULTS.autoSubmit,
       targetAccuracy: acc,
+      highAccuracy: s.highAccuracy === true && Math.abs(acc - 0.99) < 0.0001,
       reviewBeforeSubmit: s.reviewBeforeSubmit !== undefined ? s.reviewBeforeSubmit !== false : DEFAULTS.reviewBeforeSubmit,
       modelRaw: s.model !== undefined ? s.model : DEFAULTS.model,
       modelText: modelText(s.model),
@@ -2140,6 +2338,38 @@
     });
     var accVal = el('span', { class: 'accuracy-value' }, ACC_LABELS[accIndex]);
     var accWarn = el('div', { class: 'accuracy-warning' });
+    var highAccuracyOn = settings.highAccuracy === true && accIndex === 0;
+    var highAccBtn = el('button', { class: 'btn btn-sm', type: 'button' }, highAccuracyOn ? '高正确率：已开启' : '开启高正确率');
+    var highAccHint = el('div', { class: 'hint' });
+    function renderHighAcc() {
+      highAccuracyOn = highAccuracyOn && (clamp(num(accRange.value), 0, ACC_LEVELS.length - 1) === 0);
+      highAccBtn.disabled = clamp(num(accRange.value), 0, ACC_LEVELS.length - 1) !== 0;
+      highAccBtn.textContent = highAccuracyOn ? '高正确率：已开启（点击关闭）' : '开启高正确率';
+      highAccHint.textContent = clamp(num(accRange.value), 0, ACC_LEVELS.length - 1) !== 0
+        ? '仅在目标正确率 99% 时可用；切换到 90/80/60/30% 会自动关闭。'
+        : '客观题每道会做 3 次求解并取多数；主观题不做 3 次。token 消耗约 3 倍；三次答案全不同时会暂停人工复核。';
+    }
+    highAccBtn.addEventListener('click', async function () {
+      if (clamp(num(accRange.value), 0, ACC_LEVELS.length - 1) !== 0) {
+        toast('高正确率仅在 99% 正确率档位可用', 'warn');
+        return;
+      }
+      if (!highAccuracyOn) {
+        var ok = await confirmDialog({
+          title: '开启高正确率？',
+          body: el('div', {},
+            el('p', {}, '开启后：客观题每道会调用 AI 3 次，取出现次数最多的答案；主观题不做 3 次（仍按原逻辑）。'),
+            el('p', { class: 'callout callout-warn' }, 'token 消耗和时间约增至 3 倍；若某题三次答案全不同，会随机选一个并暂停等你人工复核。')
+          ),
+          okText: '开启高正确率', danger: false
+        });
+        if (!ok) return;
+        highAccuracyOn = true;
+      } else {
+        highAccuracyOn = false;
+      }
+      renderHighAcc();
+    });
     function updateAcc() {
       var idx = clamp(num(accRange.value), 0, ACC_LEVELS.length - 1);
       accVal.textContent = ACC_LABELS[idx];
@@ -2148,6 +2378,7 @@
       accWarn.textContent = isLow
         ? '⚠ 30% 档位会故意产生大量错误答案，容易影响成绩或引起注意，请谨慎使用。'
         : '仅作用于选择题/填空题，按题数比例故意改错；实际正确率受 AI 能力影响，无法保证。';
+      renderHighAcc();
     }
     accRange.addEventListener('input', updateAcc);
     updateAcc();
@@ -2178,6 +2409,11 @@
             el('div', { class: 'accuracy-line' }, accRange, accVal),
             accWarn
           ),
+          el('div', { class: 'field span-2' },
+            el('label', {}, '高正确率（客观题 3 次投票）'),
+            highAccBtn,
+            highAccHint
+          ),
           el('div', { class: 'field' },
             el('label', {}, '模型'),
             el('input', { class: 'input', type: 'text', value: settings.modelText, disabled: true, readonly: true }),
@@ -2206,6 +2442,7 @@
             var payload = {
               autoSubmit: autoCb.checked,
               reviewBeforeSubmit: reviewCb.checked,
+              highAccuracy: highAccuracyOn,
               targetAccuracy: ACC_LEVELS[clamp(num(accRange.value), 0, ACC_LEVELS.length - 1)],
               timeoutMin: timeoutMin,
               // 真实服务端使用 engineTimeoutSec（秒），两个字段都发以兼容 mock / 真实服务
