@@ -1,5 +1,5 @@
 /**
- * 学习通作业助手 (Chaoxing Homework Assistant) v1.4.0
+ * 学习通作业助手 (Chaoxing Homework Assistant) v1.5.0
  * Copyright (c) 2026 七号玩家 (sevenplayer / Lsy). All rights reserved.
  * SPDX-License-Identifier: MIT
  * Powered by DeepSeek（AI 辅助开发）
@@ -77,7 +77,7 @@ async function pageLooksLikeLogin(page) {
  * 确保受控浏览器里有登录态并停在个人中心；必要时把 session.json 的 Cookie 注入浏览器。
  * 登录态失效时抛中文错误。
  */
-export async function ensureLoggedIn(browser, session, { log = () => {}, force = false } = {}) {
+export async function ensureLoggedIn(browser, session, { log = () => {}, force = false, keepPage = false } = {}) {
   let page;
   try {
     page = await browser.ensureStarted();
@@ -100,14 +100,16 @@ export async function ensureLoggedIn(browser, session, { log = () => {}, force =
     });
     log(`已把 ${n} 个登录 Cookie 注入受控浏览器`);
     if (!n) throw new Error('登录 Cookie 注入失败（浏览器里没有登录态），请重试或改用 httpOnly 模式');
-    try {
-      await page.navigate(BASE_URL, { settleMs: 1500 });
-    } catch (e) {
-      throw new Error(`打开学习通首页失败（${e.message}）。受控浏览器可能已退出，请重试`);
+    if (!keepPage) {
+      try {
+        await page.navigate(BASE_URL, { settleMs: 1500 });
+      } catch (e) {
+        throw new Error(`打开学习通首页失败（${e.message}）。受控浏览器可能已退出，请重试`);
+      }
     }
-  } else if (force) {
+  } else if (force && !keepPage) {
     await page.navigate(BASE_URL, { settleMs: 1500 });
-  } else {
+  } else if (!keepPage) {
     let url = '';
     try {
       url = String(await page.url());

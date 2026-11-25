@@ -1,5 +1,5 @@
 /**
- * 学习通作业助手 (Chaoxing Homework Assistant) v1.4.0
+ * 学习通作业助手 (Chaoxing Homework Assistant) v1.5.0
  * Copyright (c) 2026 七号玩家 (sevenplayer / Lsy). All rights reserved.
  * SPDX-License-Identifier: MIT
  * Powered by DeepSeek（AI 辅助开发）
@@ -195,6 +195,32 @@ export async function save(browser, session, work, answers, { log = () => {} } =
     throw new Error(`暂存失败：${JSON.stringify((res && (res.data || res)) || {}).slice(0, 300)}`);
   }
   return { ok: true, raw: res, filled };
+}
+
+/** 直接暂存“当前已填/已插入附件”的页面（不重新导航、不重新填答，避免冲掉刚上传的附件） */
+export async function saveCurrent(browser, session, work, { log = () => {} } = {}) {
+  // keepPage：绝不能在这里导航到学习通首页，否则会丢失刚才上传的附件/未保存的编辑内容
+  const page = await ensureLoggedIn(browser, session, { log, keepPage: true });
+  const target = work && (work.taskUrl || work.url);
+  let cur = '';
+  try {
+    cur = String(await page.url());
+  } catch {
+    cur = '';
+  }
+  if (target && cur !== target) {
+    log('当前不在作答页，暂存前先打开作答页（可能丢失未保存内容）');
+    await page.navigate(target, { settleMs: 1200 });
+    const ok = await page.waitFor(`document.querySelectorAll('.questionLi').length > 0`, { timeoutMs: 15000, intervalMs: 600 });
+    if (!ok) throw new Error('没有打开作业作答页（可能作业已截止或页面改版），无法暂存');
+  }
+  await new Promise((r) => setTimeout(r, 300));
+  const raw = await page.eval(buildPostFormJs(false), { timeoutMs: 60000 });
+  const res = typeof raw === 'string' ? JSON.parse(raw) : raw;
+  if (!res || !res.ok || !res.data || !res.data.status) {
+    throw new Error(`暂存失败：${JSON.stringify((res && (res.data || res)) || {}).slice(0, 300)}`);
+  }
+  return { ok: true, raw: res, saved: true };
 }
 
 /** 正式提交：先 /work/validate，再 POST 表单；返回结果并落盘记录 */

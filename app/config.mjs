@@ -1,5 +1,5 @@
 /**
- * 学习通作业助手 (Chaoxing Homework Assistant) v1.4.0
+ * 学习通作业助手 (Chaoxing Homework Assistant) v1.5.0
  * Copyright (c) 2026 七号玩家 (sevenplayer / Lsy). All rights reserved.
  * SPDX-License-Identifier: MIT
  * Powered by DeepSeek（AI 辅助开发）
@@ -14,6 +14,8 @@ const CONFIG_FILE = path.join(DIRS.data, 'config.json');
 export const DEFAULT_CONFIG = {
   port: 8765,
   autoSubmit: true,          // 默认全自动提交（用户要求）；设置里可关
+  targetAccuracy: 0.99,      // 目标正确率（近似）：仅客观选择题/填空题，按题数比例；无法保证真实正确率
+  reviewBeforeSubmit: true,  // 主观/附件题提交前暂停确认（v1.5）
   model: { provider: 'deepseek-official', model: 'deepseek-flash' },
   engineTimeoutSec: 300,
   loginTimeoutSec: 300,

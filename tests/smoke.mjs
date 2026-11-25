@@ -1,5 +1,5 @@
 /**
- * 学习通作业助手 (Chaoxing Homework Assistant) v1.4.0
+ * 学习通作业助手 (Chaoxing Homework Assistant) v1.5.0
  * Copyright (c) 2026 七号玩家 (sevenplayer / Lsy). All rights reserved.
  * SPDX-License-Identifier: MIT
  * Powered by DeepSeek（AI 辅助开发）
@@ -90,6 +90,7 @@ console.log('\n[3] 编排器流程（fake cx/engine）');
   ok(j1 && j1.status === 'done', '客观题作业完成', j1 && j1.status);
   ok(j2 && j2.status === 'paused', '附件作业因缺资料暂停', j2 && j2.status);
   ok(j2 && j2.paused && j2.paused.kind === 'materials', '暂停原因类型为 materials', j2 && JSON.stringify(j2.paused));
+  ok(j2 && Array.isArray(j2.paused.missingQuestions) && j2.paused.missingQuestions.length >= 1, '暂停时附带题号/题干定位', j2 && JSON.stringify(j2.paused.missingQuestions));
   ok(summary.paused === 1, '汇总里暂停数为 1', JSON.stringify(summary));
 
   // 用户补充资料后继续
@@ -98,10 +99,53 @@ console.log('\n[3] 编排器流程（fake cx/engine）');
   fs.writeFileSync(path.join(matDir, '第6次作业模板.docx'), 'template placeholder', 'utf8');
   const resumed = await orch.resumeWork('1002');
   const j2b = jobs.get('1002');
-  ok(resumed.outcome === 'done', '补充资料后继续并完成', resumed.outcome);
-  ok(j2b.status === 'done' && j2b.files.length === 1, '附件作业记录到提交文件', JSON.stringify(j2b.files));
-  ok(j2b.result && j2b.result.submitted === true, '记录为已提交');
+  ok(resumed.outcome === 'paused' && j2b.paused && j2b.paused.kind === 'review', '补充资料后进入待确认提交', j2b && j2b.status + '/' + (j2b.paused && j2b.paused.kind));
+  const submitted2 = await orch.submitReview('1002');
+  const j2c = jobs.get('1002');
+  ok(submitted2.outcome === 'done' && j2c.status === 'done' && j2c.files.length === 1, '确认提交后完成并记录文件', JSON.stringify(j2c.files));
+  ok(j2c.result && j2c.result.submitted === true, '记录为已提交');
+
+  // 关闭自动提交：必须暂存为「待提交」，不能显示“已完成”
+  const jobs2 = new JobStore();
+  const events2 = new EventHub();
+  const orch2 = new Orchestrator({
+    config: { ...DEFAULT_CONFIG, autoSubmit: false },
+    events: events2, jobs: jobs2,
+    loadSecrets: async () => ({}),
+    saveConfig: () => {},
+    cxFactory: async () => createCx({}),
+    engineFactory: async () => createEngine({}),
+  });
+  await orch2.refresh({});
+  const r2 = await orch2.run(['1001']);
+  const jr = jobs2.get('1001');
+  ok(r2.ready === 1 && jr.status === 'ready' && jr.result && jr.result.saved === true, '关闭自动提交后状态为待提交（已暂存）', jr && jr.status + ' / ' + JSON.stringify(jr.result));
+  // 目标正确率（近似）：按题数改错，只改客观题，并记录改动
+  const jobs3 = new JobStore();
+  const events3 = new EventHub();
+  const orch3 = new Orchestrator({
+    config: { ...DEFAULT_CONFIG, autoSubmit: true, targetAccuracy: 0.8 },
+    events: events3, jobs: jobs3,
+    loadSecrets: async () => ({}),
+    saveConfig: () => {},
+    cxFactory: async () => createCx({}),
+    engineFactory: async () => createEngine({}),
+  });
+  await orch3.refresh({});
+  await orch3.run(['1001']);
+  const ja = jobs3.get('1001');
+  const changed = ja && ja.accuracy && Array.isArray(ja.accuracy.changed) ? ja.accuracy.changed : [];
+  ok(changed.length === 1, '目标正确率 80% 按题数改错 1 题', JSON.stringify(ja && ja.accuracy));
+  const baseline = { q1: 'A', q2: 'ABC', q3: ['分隔符'] };
+  const changedQid = changed[0] && changed[0].qid;
+  if (changedQid) {
+    const before = JSON.stringify(baseline[changedQid]);
+    const after = JSON.stringify(ja.answers && ja.answers.answers ? ja.answers.answers[changedQid] : null);
+    ok(before !== after, '改错后答案与原答案不同', before + ' -> ' + after);
+  }
+  events3.close();
   events.close();
+  events2.close();
 }
 
 console.log('\n[4] server.mjs 进程级冒烟');
@@ -175,6 +219,18 @@ console.log('\n[4] server.mjs 进程级冒烟');
     })).json();
     ok(resume.ok === true, '提交补充资料接口');
 
+    let reviewSeen = false;
+    for (let i = 0; i < 60; i += 1) {
+      state = await (await fetch(`${base}/api/state`)).json();
+      const p = state.paused.find((x) => x.workId === '1002');
+      if (p && p.kind === 'review') { reviewSeen = true; break; }
+      await wait(300);
+    }
+    ok(reviewSeen, '补充资料后进入待确认提交');
+    const confirm = await (await fetch(`${base}/api/jobs/1002/submit`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    })).json();
+    ok(confirm.ok === true, '确认提交接口');
     let done2 = false;
     for (let i = 0; i < 60; i += 1) {
       state = await (await fetch(`${base}/api/state`)).json();
@@ -182,10 +238,11 @@ console.log('\n[4] server.mjs 进程级冒烟');
       if (j && j.status === 'done') { done2 = true; break; }
       await wait(300);
     }
-    ok(done2, '补充资料后 1002 完成');
+    ok(done2, '确认提交后 1002 完成');
 
     const settings = await (await fetch(`${base}/api/settings`)).json();
     ok(settings.ok === true && settings.config.autoSubmit === true, '设置接口可读');
+    ok(settings.config.targetAccuracy === 0.99 && settings.config.reviewBeforeSubmit === true, '设置包含目标正确率与提交前确认');
 
     const env = await (await fetch(`${base}/api/env`)).json();
     ok(env.ok === true && Boolean(env.node && env.node.version), '环境检测接口', JSON.stringify(env.node));

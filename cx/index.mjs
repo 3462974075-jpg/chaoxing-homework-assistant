@@ -1,5 +1,5 @@
 /**
- * 学习通作业助手 (Chaoxing Homework Assistant) v1.4.0
+ * 学习通作业助手 (Chaoxing Homework Assistant) v1.5.0
  * Copyright (c) 2026 七号玩家 (sevenplayer / Lsy). All rights reserved.
  * SPDX-License-Identifier: MIT
  * Powered by DeepSeek（AI 辅助开发）
@@ -22,7 +22,7 @@ import { SessionManager } from './session.mjs';
 import { login as doLogin, LoginError } from './login.mjs';
 import { listCourses } from './course.mjs';
 import { listWorks, openWork } from './works.mjs';
-import { fillAnswers, save as saveAnswers, submit as submitAnswers, redo as redoWork } from './submit.mjs';
+import { fillAnswers, save as saveAnswers, saveCurrent as saveCurrentAnswers, submit as submitAnswers, redo as redoWork } from './submit.mjs';
 import { downloadAttachments, uploadAttachment } from './attach.mjs';
 
 function defaultLog(...args) {
@@ -186,6 +186,11 @@ export async function createCx({ dataDir, edgeProfileDir, log, port, headless = 
     async save(work, answers) {
       const res = await saveAnswers(browser, session, resolveWork(work), answers, { log: logger });
       return res;
+    },
+
+    /** 直接暂存当前已填页面（不重新填答；v1.5 关闭自动提交/审核暂停用） */
+    async saveCurrent(work) {
+      return saveCurrentAnswers(browser, session, resolveWork(work), { log: logger });
     },
 
     /** 正式提交 */

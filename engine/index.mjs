@@ -1,5 +1,5 @@
 /**
- * 学习通作业助手 (Chaoxing Homework Assistant) v1.4.0
+ * 学习通作业助手 (Chaoxing Homework Assistant) v1.5.0
  * Copyright (c) 2026 七号玩家 (sevenplayer / Lsy). All rights reserved.
  * SPDX-License-Identifier: MIT
  * Powered by DeepSeek（AI 辅助开发）
@@ -1223,6 +1223,58 @@ export function createEngine({
       } catch (err) {
         const detail = err instanceof ParseError ? err.details : { message: err && err.message };
         log(`[engine:answerShort] 解析/校验失败：${err && err.message}`);
+        return {
+          ok: false,
+          error: { code: 'BAD_MODEL_OUTPUT', message: err && err.message, detail },
+          text: runResult.text,
+          latencyMs: runResult.latencyMs,
+          runCwd: runResult.runCwd,
+        };
+      }
+    },
+
+    /** 为填空题生成“看起来合理但错误”的答案（目标正确率功能用，不返回正确答案）。 */
+    async makeWrongAnswers({
+      work,
+      questions = [],
+      correctAnswers = {},
+      cwd,
+      onEvent,
+      maxPromptChars = 20_000,
+      timeoutMs: stepTimeoutMs = Math.min(timeoutMs, 120_000),
+    } = {}) {
+      if (!Array.isArray(questions) || !questions.length) return { ok: true, answers: {}, latencyMs: 0 };
+      const prompt = prompts.buildWrongAnswersPrompt({
+        work,
+        questions,
+        correctAnswers,
+        maxChars: maxPromptChars,
+      });
+      const runResult = await run({ step: 'makeWrongAnswers', prompt, cwd, onEvent, timeoutMs: stepTimeoutMs });
+      if (!runResult.ok) return fail('makeWrongAnswers', runResult);
+      try {
+        const { json } = extractJson(runResult.text);
+        const src = (json && json.answers && typeof json.answers === 'object') ? json.answers : json;
+        const answers = {};
+        for (const q of questions) {
+          const qid = String(q.qid);
+          const value = src && src[qid];
+          if (value == null) continue;
+          if (Array.isArray(value)) {
+            const arr = value.map((x) => String(x ?? '').trim()).filter(Boolean);
+            if (arr.length) answers[qid] = arr;
+          } else {
+            const text = String(value).trim();
+            if (text) answers[qid] = text;
+          }
+        }
+        if (!Object.keys(answers).length) {
+          return { ok: false, error: { code: 'EMPTY_CONTENT', message: 'AI 未返回错误答案' }, latencyMs: runResult.latencyMs, runCwd: runResult.runCwd };
+        }
+        return { ok: true, answers, latencyMs: runResult.latencyMs, attempts: runResult.attempts ?? 1, runCwd: runResult.runCwd, raw: json };
+      } catch (err) {
+        const detail = err instanceof ParseError ? err.details : { message: err && err.message };
+        log(`[engine:makeWrongAnswers] 解析失败：${err && err.message}`);
         return {
           ok: false,
           error: { code: 'BAD_MODEL_OUTPUT', message: err && err.message, detail },

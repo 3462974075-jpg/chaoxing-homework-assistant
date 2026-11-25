@@ -1,5 +1,5 @@
 /**
- * 学习通作业助手 (Chaoxing Homework Assistant) v1.4.0
+ * 学习通作业助手 (Chaoxing Homework Assistant) v1.5.0
  * Copyright (c) 2026 七号玩家 (sevenplayer / Lsy). All rights reserved.
  * SPDX-License-Identifier: MIT
  * Powered by DeepSeek（AI 辅助开发）
@@ -10,6 +10,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { DIRS, CX_DIR, ENGINE_DIR, MODULE_ROOT, findDshBin } from './paths.mjs';
+import * as accuracy from './accuracy.mjs';
+import { humanizeError } from './errors.mjs';
 
 const OBJECTIVE_TYPES = new Set(['single', 'multi', 'judge', 'blank', 'choice', 'truefalse']);
 const SHORT_TYPES = new Set(['short', 'essay', 'subjective', 'answer']);
@@ -227,7 +229,7 @@ export class Orchestrator {
     this.running = true;
     this.stopFlag = false;
     this.pauseFlag = false;
-    const summary = { total: works.length, done: 0, paused: 0, failed: 0, skipped: 0, results: [] };
+    const summary = { total: works.length, done: 0, ready: 0, paused: 0, failed: 0, skipped: 0, results: [] };
     this.events.broadcast('run-start', { workIds: list, total: works.length });
     this.events.info(`开始批量作业：${works.length} 项`);
     // 预检：先确认 AI 引擎可用，避免打开作业后才发现引擎/凭据/入口有问题
@@ -250,6 +252,7 @@ export class Orchestrator {
         const res = await this._runOne(work);
         summary.results.push(res);
         if (res.outcome === 'done') summary.done += 1;
+        else if (res.outcome === 'ready') summary.ready += 1;
         else if (res.outcome === 'paused') summary.paused += 1;
         else if (res.outcome === 'skipped') summary.skipped += 1;
         else summary.failed += 1;
@@ -257,7 +260,7 @@ export class Orchestrator {
     } finally {
       this.running = false;
       this.events.broadcast('run-done', { summary });
-      this.events.info(`批量作业结束：成功 ${summary.done}，暂停 ${summary.paused}，失败 ${summary.failed}`);
+      this.events.info(`批量作业结束：提交 ${summary.done}，待提交 ${summary.ready}，暂停 ${summary.paused}，失败 ${summary.failed}`);
     }
     return summary;
   }
@@ -469,6 +472,10 @@ export class Orchestrator {
       const shorts = job.questions.filter((q) => SHORT_TYPES.has(String(q.type || '').toLowerCase()));
       const other = job.questions.filter((q) => !objective.includes(q) && !shorts.includes(q));
       const needsFile = job.kind === 'attach' || job.kind === 'mixed' || attachments.length > 0 || other.length > 0;
+      const hasSubjective = shorts.length > 0 || needsFile;
+      if (hasSubjective && this.config.autoSubmit && this.config.reviewBeforeSubmit !== false) {
+        this.events.warn(`「${job.name}」包含主观题/附件题，生成完成后会先暂存并暂停，等你确认后再提交。`);
+      }
 
       const priorAnswers = (job.answers && job.answers.answers && typeof job.answers.answers === 'object')
         ? { ...job.answers.answers }
@@ -558,7 +565,9 @@ export class Orchestrator {
             }
             const missingQids = (solved && (solved.missing || errDetail.failedQids)) || [];
             this._writeManualTemplate(job, missingQids);
-            return this._pauseJob(job, 'materials', this._enginePauseReason('求解', err), detail, emit);
+            return this._pauseJob(job, 'materials', this._enginePauseReason('求解', err), detail, emit, {
+              missingQuestions: this._questionRefs(missingQids, job.questions),
+            });
           }
           Object.assign(answers.answers, solved.answers || {});
           sources = (sources || []).concat(solved.sources || []);
@@ -576,8 +585,11 @@ export class Orchestrator {
         if (unanswered.length) {
           const qids = unanswered.map((q) => q.qid);
           this._writeManualTemplate(job, qids);
-          return this._pauseJob(job, 'materials', `还有 ${unanswered.length} 道客观题未解出，已保留已得答案；可在 data\\materials\\${job.workId}\\manual-answers.json 手填后点“继续”重试`, qids, emit);
+          return this._pauseJob(job, 'materials', `还有 ${unanswered.length} 道客观题未解出，已保留已得答案；可在 data\\materials\\${job.workId}\\manual-answers.json 手填后点“继续”重试`, qids, emit, {
+            missingQuestions: this._questionRefs(qids, job.questions),
+          });
         }
+        await this._applyTargetAccuracy({ job, objective, answers, manualQids: Object.keys(manualAnswers), engine, emit });
       }
 
       // 5. 简答题：逐题生成文字（已答过的题复用）
@@ -594,10 +606,14 @@ export class Orchestrator {
           });
           if (!r || r.ok === false) {
             const err = (r && r.error) || {};
-            return this._pauseJob(job, 'materials', this._enginePauseReason('简答', err), [err.message || 'AI 未返回有效结果'], emit);
+            return this._pauseJob(job, 'materials', this._enginePauseReason('简答', err), [err.message || 'AI 未返回有效结果'], emit, {
+              missingQuestions: this._questionRefs([q.qid], job.questions),
+            });
           }
           if (r.needMaterials && r.needMaterials.length && !String(r.text || '').trim()) {
-            return this._pauseJob(job, 'materials', '题目缺少资料，无法作答', r.needMaterials, emit);
+            return this._pauseJob(job, 'materials', '题目缺少资料，无法作答', r.needMaterials, emit, {
+              missingQuestions: this._questionRefs([q.qid], job.questions),
+            });
           }
           answers.answers[q.qid] = String(r.text || '').trim();
           if (r.sources) sources.push(...r.sources);
@@ -632,10 +648,14 @@ export class Orchestrator {
         }
         if (!docResult || docResult.ok === false) {
           const err = (docResult && docResult.error) || {};
-          return this._pauseJob(job, 'materials', this._enginePauseReason('生成作业文件', err), [err.message || 'AI 未返回有效结果'], emit);
+          return this._pauseJob(job, 'materials', this._enginePauseReason('生成作业文件', err), [err.message || 'AI 未返回有效结果'], emit, {
+            missingQuestions: this._questionRefs(job.questions.map((q) => q.qid), job.questions),
+          });
         }
         if (docResult.needMaterials && docResult.needMaterials.length) {
-          return this._pauseJob(job, 'materials', '缺少完成作业所需的资料', docResult.needMaterials, emit);
+          return this._pauseJob(job, 'materials', '缺少完成作业所需的资料', docResult.needMaterials, emit, {
+            missingQuestions: this._questionRefs(job.questions.map((q) => q.qid), job.questions),
+          });
         }
         submissionFile = docResult.filePath;
         if (!submissionFile || !fs.existsSync(submissionFile)) {
@@ -663,7 +683,58 @@ export class Orchestrator {
         finishStep('upload', '附件已上传');
       }
 
-      // 9. 提交
+      // 9. 提交 / 暂存 / 主观题审核暂停
+      const reviewBeforeSubmit = this.config.reviewBeforeSubmit !== false;
+      const mustSaveDraft = !this.config.autoSubmit || (this.config.autoSubmit && hasSubjective && reviewBeforeSubmit);
+      const reviewQids = job.questions
+        .filter((q) => {
+          const t = String(q.type || '').toLowerCase();
+          return SHORT_TYPES.has(t) || !OBJECTIVE_TYPES.has(t);
+        })
+        .map((q) => q.qid);
+
+      if (mustSaveDraft) {
+        setPhase('save', '保存到学习通（暂存）');
+        let drafted = null;
+        if (typeof cx.saveCurrent === 'function') {
+          drafted = await cx.saveCurrent(work);
+        } else if (typeof cx.save === 'function') {
+          drafted = await cx.save(work, answers);
+        } else {
+          throw new Error('当前学习通模块不支持暂存，无法在关闭自动提交时保存答案');
+        }
+        if (drafted && drafted.ok === false) throw new Error('暂存失败：' + JSON.stringify(drafted).slice(0, 400));
+        finishStep('save', '已暂存到学习通');
+
+        if (this.config.autoSubmit && hasSubjective && reviewBeforeSubmit) {
+          return this._pauseJob(
+            job,
+            'review',
+            '检测到主观题/附件题：已暂存到学习通，建议打开作业页检查后手动提交',
+            [
+              '若确认答案/附件无误，可点「仍然提交」由程序提交；',
+              '也可点「打开作业页」在受控浏览器里检查，或点「仅保存，稍后手动提交」；',
+              'AI 生成内容可能有误，请以作业页面实际内容为准。',
+            ],
+            emit,
+            { reviewQuestions: this._questionRefs(reviewQids, job.questions) }
+          );
+        }
+
+        job.status = 'ready';
+        job.phase = 'ready';
+        job.result = {
+          submitted: false,
+          saved: true,
+          at: new Date().toISOString(),
+          note: '已暂存到学习通，等待手动提交',
+        };
+        this.jobs.save(job);
+        emit('job-done', { status: 'ready', result: job.result, files: job.files || [] });
+        this.events.warn(`「${job.name}」已暂存，等待手动提交（学习通进度可能在提交后才更新）`);
+        return { workId: job.workId, name: job.name, outcome: 'ready', result: job.result };
+      }
+
       if (this.config.autoSubmit) {
         setPhase('submit', '提交作业');
         const sub = await cx.submitAnswers(work, answers);
@@ -688,30 +759,193 @@ export class Orchestrator {
       emit('job-done', { result: job.result, files: job.files });
       return { workId: job.workId, name: job.name, outcome: 'done', result: job.result };
     } catch (e) {
+      const h = humanizeError(e);
       job.status = 'failed';
       job.phase = 'failed';
-      job.error = e.message;
+      job.error = h.message;
+      job.errorCode = h.code;
+      job.errorHint = h.hint;
+      job.errorRaw = h.raw;
       this.jobs.save(job);
-      this.events.error(`「${job.name}」失败：${e.message}`);
-      emit('job-done', { error: e.message, files: job.files || [] });
-      return { workId: job.workId, name: job.name, outcome: 'failed', error: e.message };
+      this.events.error(`「${job.name}」失败：${h.message}${h.hint ? '（' + h.hint + '）' : ''}`);
+      this.log('[engine] 原始错误：' + h.raw);
+      emit('job-done', { error: h.message, errorCode: h.code, errorHint: h.hint, errorRaw: h.raw, files: job.files || [] });
+      return { workId: job.workId, name: job.name, outcome: 'failed', error: h.message };
     }
   }
 
-  _pauseJob(job, kind, reason, detail, emit) {
+  _questionRefs(qids, questions = []) {
+    const typeLabel = {
+      single: '单选题', multi: '多选题', judge: '判断题', truefalse: '判断题',
+      blank: '填空题', choice: '选择题', short: '简答题', essay: '论述题',
+      subjective: '主观题', answer: '简答题', other: '其他',
+    };
+    const list = Array.isArray(questions) ? questions : [];
+    const indexMap = new Map(list.map((q, i) => [String(q.qid), i + 1]));
+    const qmap = new Map(list.map((q) => [String(q.qid), q]));
+    const out = [];
+    for (const raw of qids || []) {
+      const qid = String(raw);
+      const q = qmap.get(qid);
+      const index = indexMap.get(qid) || 0;
+      if (!q) { out.push({ qid, index, type: '', typeLabel: '未知', stem: '' }); continue; }
+      out.push({
+        qid,
+        index,
+        type: q.type || '',
+        typeLabel: typeLabel[String(q.type || '').toLowerCase()] || String(q.type || '未知'),
+        stem: String(q.stem || q.title || '').replace(/\s+/g, ' ').slice(0, 160),
+      });
+    }
+    return out;
+  }
+
+  async _applyTargetAccuracy({ job, objective, answers, manualQids, engine, emit }) {
+    const target = accuracy.normalizeTargetAccuracy(this.config.targetAccuracy);
+    if (target >= 0.99 || !objective.length) return null;
+    if (job.accuracy && job.accuracy.applied) return job.accuracy;
+    const plan = accuracy.planTargetAccuracy({
+      questions: job.questions,
+      answers,
+      excludeQids: manualQids,
+      target,
+      seed: job.workId,
+    });
+    const blankSelected = plan.selected.filter((x) => x.kind === 'blank');
+    const blankWrong = {};
+    if (blankSelected.length && engine && typeof engine.makeWrongAnswers === 'function') {
+      try {
+        const wr = await engine.makeWrongAnswers({
+          work: { workId: job.workId, name: job.name },
+          questions: blankSelected.map((x) => objective.find((q) => String(q.qid) === x.qid) || { qid: x.qid }),
+          correctAnswers: answers.answers,
+          cwd: path.join(DIRS.jobs, job.workId, 'engine-wrong'),
+          onEvent: (ev) => emit('engine', ev),
+        });
+        if (wr && wr.ok !== false && wr.answers) Object.assign(blankWrong, wr.answers);
+        else this.events.warn(`填空题错误答案生成失败，将使用兜底错误答案：${(wr && wr.error && wr.error.message) || '未知'}`);
+      } catch (e) {
+        this.events.warn(`填空题错误答案生成异常，将使用兜底错误答案：${e.message}`);
+      }
+    }
+    const applied = accuracy.applyTargetAccuracyFor({ plan, answers, questions: job.questions, blankWrong });
+    job.answers = answers;
+    job.accuracy = {
+      target,
+      eligibleCount: plan.eligibleCount,
+      intendedWrong: plan.wrongCount,
+      changed: applied.changed.map((x) => ({ qid: x.qid, index: x.index, type: x.type })),
+      failed: applied.failed,
+      applied: true,
+      at: new Date().toISOString(),
+    };
+    this.jobs.save(job);
+    const pct = Math.round(target * 100);
+    if (applied.changed.length) {
+      const note = `已按目标正确率 ${pct}% 调整 ${applied.changed.length} 道客观题（第 ${applied.changed.map((x) => x.index).join('、')} 题）；实际正确率受 AI 能力影响，无法保证。`;
+      this.events.warn(note);
+      emit('accuracy', { target, changed: job.accuracy.changed, note });
+    } else {
+      this.events.warn(`目标正确率 ${pct}%，但没有可调整的客观题（或题目数量太少）。`);
+    }
+    if (target <= 0.3) {
+      this.events.warn('当前为 30% 档位：会产生大量故意错误答案，容易影响成绩/引起注意，请谨慎使用。');
+    }
+    return job.accuracy;
+  }
+
+  _pauseJob(job, kind, reason, detail, emit, extra = {}) {
     job.status = 'paused';
     job.phase = 'paused';
     job.paused = {
       kind,
       reason,
       detail,
+      missingQuestions: Array.isArray(extra.missingQuestions) ? extra.missingQuestions : [],
+      reviewQuestions: Array.isArray(extra.reviewQuestions) ? extra.reviewQuestions : [],
       materialsDir: path.join(DIRS.materials, job.workId),
       at: new Date().toISOString(),
     };
     this.jobs.save(job);
-    emit('job-paused', { kind, reason, detail });
-    this.events.warn(`「${job.name}」已暂停：${reason}（${JSON.stringify(detail).slice(0, 200)}）`);
+    emit('job-paused', {
+      kind,
+      reason,
+      detail,
+      missingQuestions: job.paused.missingQuestions,
+      reviewQuestions: job.paused.reviewQuestions,
+    });
+    this.events.warn(`「${job.name}」已暂停：${reason}${detail ? '（' + JSON.stringify(detail).slice(0, 200) + '）' : ''}`);
     return { workId: job.workId, name: job.name, outcome: 'paused', reason, detail };
+  }
+
+  /** 审核暂停后：打开作业页（受控 Edge），供用户检查。 */
+  async openReview(workId) {
+    const job = this.jobs.get(String(workId));
+    if (!job) throw new Error('找不到该作业记录');
+    const cx = await this._loadCx();
+    const work = this.findWork(workId) || {
+      workId: job.workId, courseId: job.courseId, courseName: job.courseName,
+      name: job.name, kind: job.kind, status: job.status, url: job.url,
+    };
+    await cx.openWork(work);
+    return { ok: true };
+  }
+
+  /** 审核暂停后：用户确认提交。 */
+  async submitReview(workId) {
+    if (this.running) throw new Error('队列仍在运行，请等运行结束或先停止后再提交');
+    const job = this.jobs.get(String(workId));
+    if (!job) throw new Error('找不到该作业记录');
+    if (job.status !== 'paused' || !job.paused || job.paused.kind !== 'review') throw new Error('该作业当前不在“待确认提交”状态');
+    const cx = await this._loadCx();
+    const work = this.findWork(workId) || {
+      workId: job.workId, courseId: job.courseId, courseName: job.courseName,
+      name: job.name, kind: job.kind, status: job.status, url: job.url,
+    };
+    try {
+      const sub = await cx.submitAnswers(work, job.answers || { answers: {} });
+      if (sub && sub.ok === false) throw new Error('提交失败：' + JSON.stringify(sub).slice(0, 400));
+      job.result = { submitted: true, at: new Date().toISOString(), raw: sub && sub.raw ? String(JSON.stringify(sub.raw)).slice(0, 500) : '' };
+      job.status = 'done';
+      job.phase = 'done';
+      job.paused = null;
+      job.error = '';
+      job.errorCode = '';
+      job.errorHint = '';
+      job.errorRaw = '';
+      this.jobs.save(job);
+      this.events.info(`「${job.name}」已确认提交成功`);
+      this.events.broadcast('job-done', { workId: job.workId, name: job.name, status: 'done', result: job.result, files: job.files || [] });
+      return { ok: true, outcome: 'done', result: job.result };
+    } catch (e) {
+      const h = humanizeError(e);
+      job.paused = {
+        ...(job.paused || {}),
+        kind: 'review',
+        reason: '提交失败：' + h.message,
+        detail: [h.hint || '请打开作业页检查后重试。'],
+        at: new Date().toISOString(),
+      };
+      this.jobs.save(job);
+      this.events.error(`「${job.name}」提交失败：${h.message}`);
+      this.log('[engine] 提交原始错误：' + h.raw);
+      throw new Error(h.message + (h.hint ? '；' + h.hint : ''));
+    }
+  }
+
+  /** 审核暂停后：仅保留暂存，稍后手动提交。 */
+  async markReady(workId) {
+    if (this.running) throw new Error('队列仍在运行，请等运行结束或先停止后再操作');
+    const job = this.jobs.get(String(workId));
+    if (!job) throw new Error('找不到该作业记录');
+    job.status = 'ready';
+    job.phase = 'ready';
+    job.paused = null;
+    job.result = { submitted: false, saved: true, at: new Date().toISOString(), note: '已暂存到学习通，等待手动提交' };
+    this.jobs.save(job);
+    this.events.broadcast('job-done', { workId: job.workId, name: job.name, status: 'ready', result: job.result, files: job.files || [] });
+    this.events.warn(`「${job.name}」已标记为待提交（已暂存）`);
+    return { ok: true, outcome: 'ready', result: job.result };
   }
 
   async resumeWork(workId) {

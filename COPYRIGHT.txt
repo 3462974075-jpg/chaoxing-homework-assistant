@@ -1,4 +1,4 @@
-学习通作业助手（Chaoxing Homework Assistant）· v1.4.0
+学习通作业助手（Chaoxing Homework Assistant）· v1.5.0
 ============================================================
 
 版权所有 © 2026 七号玩家（sevenplayer / Lsy）

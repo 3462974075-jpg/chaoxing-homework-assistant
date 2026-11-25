@@ -1,5 +1,5 @@
 /**
- * 学习通作业助手 (Chaoxing Homework Assistant) v1.4.0
+ * 学习通作业助手 (Chaoxing Homework Assistant) v1.5.0
  * Copyright (c) 2026 七号玩家 (sevenplayer / Lsy). All rights reserved.
  * SPDX-License-Identifier: MIT
  * Powered by DeepSeek（AI 辅助开发）
@@ -12,6 +12,8 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { DIRS, UI_DIR, findDshBin, ensureDirs } from './paths.mjs';
 import { loadConfig, saveConfig } from './config.mjs';
+import { normalizeTargetAccuracy } from './accuracy.mjs';
+import { humanizeError } from './errors.mjs';
 import { EventHub } from './events.mjs';
 import { JobStore } from './jobs.mjs';
 import { Orchestrator } from './orchestrator.mjs';
@@ -141,6 +143,10 @@ async function buildState() {
     progress: jobProgress(j),
     result: j.result,
     error: j.error,
+    errorCode: j.errorCode || '',
+    errorHint: j.errorHint || '',
+    errorRaw: j.errorRaw || '',
+    accuracy: j.accuracy || null,
     updatedAt: j.updatedAt,
   }));
   const paused = jobs.list()
@@ -152,6 +158,8 @@ async function buildState() {
       kind: (j.paused && j.paused.kind) || 'materials',
       reason: (j.paused && j.paused.reason) || '需要处理',
       detail: (j.paused && j.paused.detail) || [],
+      missingQuestions: (j.paused && j.paused.missingQuestions) || [],
+      reviewQuestions: (j.paused && j.paused.reviewQuestions) || [],
       createdAt: (j.paused && j.paused.at) || j.updatedAt,
     }));
   const dsh = checkDsh();
@@ -180,7 +188,7 @@ async function buildState() {
 }
 
 function jobProgress(job) {
-  if (job.status === 'done') return 100;
+  if (job.status === 'done' || job.status === 'ready') return 100;
   const steps = job.steps || [];
   const done = steps.filter((s) => s.status === 'done').length;
   if (!steps.length) return 0;
@@ -191,6 +199,8 @@ function publicConfig() {
   return {
     port: config.port,
     autoSubmit: config.autoSubmit,
+    targetAccuracy: config.targetAccuracy,
+    reviewBeforeSubmit: config.reviewBeforeSubmit !== false,
     model: config.model,
     engineTimeoutSec: config.engineTimeoutSec,
     loginTimeoutSec: config.loginTimeoutSec,
@@ -403,6 +413,39 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, { ok: true, job });
   }
 
+  const reviewSubmitMatch = p.match(/^\/api\/jobs\/([^/]+)\/submit$/);
+  if (method === 'POST' && reviewSubmitMatch) {
+    const workId = decodeURIComponent(reviewSubmitMatch[1]);
+    try {
+      const result = await orchestrator.submitReview(workId);
+      return sendJson(res, 200, { ok: true, ...result });
+    } catch (e) {
+      return sendJson(res, 400, { ok: false, error: humanizeError(e).message, detail: humanizeError(e) });
+    }
+  }
+
+  const reviewReadyMatch = p.match(/^\/api\/jobs\/([^/]+)\/ready$/);
+  if (method === 'POST' && reviewReadyMatch) {
+    const workId = decodeURIComponent(reviewReadyMatch[1]);
+    try {
+      const result = await orchestrator.markReady(workId);
+      return sendJson(res, 200, { ok: true, ...result });
+    } catch (e) {
+      return sendJson(res, 400, { ok: false, error: humanizeError(e).message });
+    }
+  }
+
+  const reviewOpenMatch = p.match(/^\/api\/jobs\/([^/]+)\/open$/);
+  if (method === 'POST' && reviewOpenMatch) {
+    const workId = decodeURIComponent(reviewOpenMatch[1]);
+    try {
+      const result = await orchestrator.openReview(workId);
+      return sendJson(res, 200, { ok: true, ...result });
+    } catch (e) {
+      return sendJson(res, 400, { ok: false, error: humanizeError(e).message });
+    }
+  }
+
   const matMatch = p.match(/^\/api\/jobs\/([^/]+)\/materials$/);
   if (method === 'POST' && matMatch) {
     const workId = decodeURIComponent(matMatch[1]);
@@ -429,10 +472,12 @@ async function handleApi(req, res, url) {
 
   if (method === 'POST' && p === '/api/settings') {
     const body = await readBody(req);
-    const allowed = ['autoSubmit', 'engineTimeoutSec', 'loginTimeoutSec', 'model'];
+    const allowed = ['autoSubmit', 'engineTimeoutSec', 'loginTimeoutSec', 'model', 'targetAccuracy', 'reviewBeforeSubmit'];
     for (const k of allowed) {
       if (body[k] !== undefined) config[k] = body[k];
     }
+    if (config.targetAccuracy !== undefined) config.targetAccuracy = normalizeTargetAccuracy(config.targetAccuracy);
+    if (config.reviewBeforeSubmit !== undefined) config.reviewBeforeSubmit = config.reviewBeforeSubmit !== false;
     saveConfig(config);
     events.info('设置已保存');
     return sendJson(res, 200, { ok: true, config: publicConfig() });

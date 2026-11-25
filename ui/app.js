@@ -1,5 +1,5 @@
 /**
- * 学习通作业助手 (Chaoxing Homework Assistant) v1.4.0
+ * 学习通作业助手 (Chaoxing Homework Assistant) v1.5.0
  * Copyright (c) 2026 七号玩家 (sevenplayer / Lsy). All rights reserved.
  * SPDX-License-Identifier: MIT
  * Powered by DeepSeek（AI 辅助开发）
@@ -28,21 +28,21 @@
   var KIND_CLASS = { quiz: 'chip-blue', attach: 'chip-purple', mixed: 'chip-cyan', unknown: 'chip-gray' };
 
   var STATUS_LABEL = {
-    queued: '排队中', running: '进行中', done: '已完成', paused: '已暂停', failed: '失败', skipped: '已跳过', unknown: '未知'
+    queued: '排队中', running: '进行中', done: '已完成', ready: '待提交', paused: '已暂停', failed: '失败', skipped: '已跳过', unknown: '未知'
   };
   var STATUS_CLASS = {
-    queued: 'chip-gray', running: 'chip-blue', done: 'chip-green', paused: 'chip-orange',
+    queued: 'chip-gray', running: 'chip-blue', done: 'chip-green', ready: 'chip-orange', paused: 'chip-orange',
     failed: 'chip-red', skipped: 'chip-gray', unknown: 'chip-gray'
   };
 
   // 步骤名称（真实服务端 phases + 常见别名）→ 展示文案
   var STEP_DISPLAY = {
     fetch: '取题', open: '打开作业 / 取题', attachments: '下载附件', solve: 'AI 求解',
-    short: '撰写简答', doc: '生成作业文件', fill: '填写答案', upload: '上传附件',
+    short: '撰写简答', doc: '生成作业文件', fill: '填写答案', upload: '上传附件', save: '暂存答案',
     submit: '提交', paused: '暂停', done: '完成'
   };
 
-  var DEFAULTS = { autoSubmit: true, model: 'deepseek-chat', port: 8765, concurrency: 1, timeoutMin: 10 };
+  var DEFAULTS = { autoSubmit: true, targetAccuracy: 0.99, reviewBeforeSubmit: true, model: 'deepseek-chat', port: 8765, concurrency: 1, timeoutMin: 10 };
 
   var CLEAR_FALLBACK = [
     { scope: 'session', label: '登录 Cookie', desc: '清除后需要重新登录学习通。' },
@@ -548,19 +548,25 @@
     var job = ensureJob(ev.workId, ev);
     // 真实服务端失败时只带 error 字段（没有 ok:false），这里兜底判定
     var ok = ev.ok !== false && !ev.error;
-    job.status = ok ? 'done' : 'failed';
+    var result = ev.result || ev.data || job.result || null;
+    var isReady = ev.status === 'ready' || Boolean(result && result.saved && !result.submitted);
+    job.status = !ok ? 'failed' : (isReady ? 'ready' : 'done');
     job.progress = 100;
-    job.result = ev.result || ev.data || null;
+    job.result = result;
+    if (ev.errorCode) job.errorCode = ev.errorCode;
+    if (ev.errorHint) job.errorHint = ev.errorHint;
+    if (ev.errorRaw) job.errorRaw = ev.errorRaw;
     job.endedAt = Date.now();
     S.run.paused.delete(ev.workId);
     var note = '';
     if (!ok && ev.error) note = '，' + String(ev.error).slice(0, 300);
+    else if (isReady) note = '，已暂存待手动提交';
     else if (job.result && typeof job.result === 'object') {
       if (job.result.score != null) note = '，得分 ' + job.result.score;
       else if (job.result.message) note = '，' + job.result.message;
       else if (job.result.note) note = '，' + job.result.note;
     }
-    addLog(ok ? 'ok' : 'error', '作业' + (ok ? '完成' : '失败') + '：' + (job.name || ev.workId) + note, ev.workId);
+    addLog(!ok ? 'error' : (isReady ? 'warn' : 'ok'), '作业' + (!ok ? '失败' : (isReady ? '待提交' : '完成')) + '：' + (job.name || ev.workId) + note, ev.workId);
     renderRun();
   }
 
@@ -575,6 +581,8 @@
       kind: ev.kind,
       reason: ev.reason || ev.message || ev.detail,
       detail: ev.detail,
+      missingQuestions: ev.missingQuestions,
+      reviewQuestions: ev.reviewQuestions,
       createdAt: ev.ts || Date.now()
     });
     S.run.paused.set(ev.workId, p);
@@ -643,7 +651,7 @@
       addLog('warn', '运行结束（已停止）');
     } else {
       var sum = computeSummary();
-      addLog('ok', '运行结束：共 ' + sum.total + ' 项，完成 ' + sum.done + '，暂停 ' + sum.paused + '，失败 ' + sum.failed);
+      addLog('ok', '运行结束：共 ' + sum.total + ' 项，提交 ' + sum.done + '，待提交 ' + sum.ready + '，暂停 ' + sum.paused + '，失败 ' + sum.failed);
       toast('运行结束，已生成结果汇总', 'ok');
     }
     renderRun();
@@ -802,12 +810,14 @@
     var s = String(raw == null ? '' : raw).toLowerCase();
     if (!s) return 'queued';
     if (s === 'done' || s === 'success' || s === 'completed' || s === 'finished') return 'done';
+    if (s === 'ready' || s === 'awaiting_submit' || s === 'saved') return 'ready';
     if (s === 'failed' || s === 'error' || s === 'fail') return 'failed';
     if (s === 'paused' || s === 'pause') return 'paused';
     if (s === 'running' || s === 'active' || s === 'doing') return 'running';
     if (s === 'queued' || s === 'pending' || s === 'waiting') return 'queued';
     if (s === 'skipped') return 'skipped';
     if (/完成|成功/.test(s)) return 'done';
+    if (/待提交|已暂存/.test(s)) return 'ready';
     if (/失败|错误/.test(s)) return 'failed';
     if (/暂停/.test(s)) return 'paused';
     if (/跳过/.test(s)) return 'skipped';
@@ -820,6 +830,7 @@
     if (!item) return '';
     var raw = item.outcome != null ? item.outcome : item.status;
     if (raw === 'done') return 'done';
+    if (raw === 'ready') return 'ready';
     if (raw === 'paused') return 'paused';
     if (raw === 'failed') return 'failed';
     if (raw === 'skipped') return 'skipped';
@@ -843,7 +854,7 @@
     var reason = p.reason || p.message || p.pauseReason || p.detail || '需要人工处理';
     if (typeof reason !== 'string') reason = String(reason);
     var kind = p.kind;
-    if (kind !== 'materials' && kind !== 'human') {
+    if (kind !== 'materials' && kind !== 'human' && kind !== 'review') {
       if (/资料|素材|附件|模板|数据|文件/.test(reason)) kind = 'materials';
       else kind = 'human';
     }
@@ -854,15 +865,18 @@
       kind: kind,
       reason: reason,
       detail: p.detail || null,
+      missingQuestions: Array.isArray(p.missingQuestions) ? p.missingQuestions : [],
+      reviewQuestions: Array.isArray(p.reviewQuestions) ? p.reviewQuestions : [],
       createdAt: p.createdAt || p.ts || Date.now()
     };
   }
 
   function computeSummary() {
     var jobs = Array.from(S.run.jobs.values());
-    var out = { total: jobs.length, done: 0, failed: 0, paused: 0, running: 0, queued: 0 };
+    var out = { total: jobs.length, done: 0, ready: 0, failed: 0, paused: 0, running: 0, queued: 0 };
     jobs.forEach(function (j) {
       if (j.status === 'done') out.done++;
+      else if (j.status === 'ready') out.ready++;
       else if (j.status === 'failed') out.failed++;
       else if (j.status === 'running') out.running++;
       else if (j.status === 'paused') out.paused++;
@@ -1564,6 +1578,7 @@
       el('div', { class: 'run-stats' },
         stat('总数', sum.total, 'blue'),
         stat('完成', sum.done, 'green'),
+        sum.ready ? stat('待提交', sum.ready, 'orange') : null,
         stat('暂停', sum.paused, 'orange'),
         stat('失败', sum.failed, 'red'),
         sum.queued + sum.running ? stat('进行/排队', sum.queued + sum.running, 'blue') : null
@@ -1610,6 +1625,7 @@
     if (S.run.stopped) return { label: '已停止', cls: 'stopped' };
     if (S.run.jobs.size > 0) {
       if (sum.paused > 0) return { label: '已结束 · 有待处理项', cls: 'paused' };
+      if (sum.ready > 0) return { label: '已结束 · 有待提交项', cls: 'paused' };
       if (sum.failed > 0) return { label: '已结束 · 有失败项', cls: 'stopped' };
       return { label: '已结束', cls: 'done' };
     }
@@ -1641,6 +1657,15 @@
         job.status === 'running' ? el('div', { class: 'progress job-progress' }, el('div', { class: 'bar', style: 'width:' + progress + '%' })) : null
       ),
       el('div', { class: 'row' },
+        job.status === 'ready' ? el('button', {
+          class: 'btn btn-sm', type: 'button',
+          onclick: async function (e) {
+            var btn = e.currentTarget; setBtnBusy(btn, true);
+            try { await api('/api/jobs/' + encodeURIComponent(job.workId) + '/open', { method: 'POST', body: {}, timeout: 60000 }); toast('已在受控浏览器打开作业页', 'ok'); }
+            catch (err) { toast('打开失败：' + errMsg(err), 'error'); }
+            finally { setBtnBusy(btn, false); }
+          }
+        }, '打开作业页') : null,
         el('button', {
           class: 'btn btn-sm btn-ghost', type: 'button',
           onclick: function () { openJobDetail(job.workId); }
@@ -1649,11 +1674,29 @@
     );
   }
 
+  function questionRefsBlock(refs) {
+    if (!Array.isArray(refs) || !refs.length) return null;
+    var box = el('div', { class: 'detail-section', style: 'margin-top:8px' },
+      el('h4', {}, '涉及题目（AI 定位，仅供参考）')
+    );
+    var list = el('div', { class: 'stack' });
+    refs.forEach(function (r) {
+      list.appendChild(el('div', { class: 'small', style: 'padding:4px 0;border-bottom:1px solid var(--line)' },
+        el('span', { class: 'chip chip-gray', style: 'margin-right:6px' }, '第' + (r.index || '?') + '题'),
+        el('span', { class: 'muted' }, (r.typeLabel || r.type || '未知') + ' · '),
+        el('span', {}, (r.stem || '（题干未获取）').slice(0, 120))
+      ));
+    });
+    box.appendChild(list);
+    return box;
+  }
+
   function pausedCard(p) {
     var isHuman = p.kind === 'human';
-    var card = el('div', { class: 'panel pause-card ' + (isHuman ? 'human' : '') });
+    var isReview = p.kind === 'review';
+    var card = el('div', { class: 'panel pause-card ' + (isHuman ? 'human' : (isReview ? 'review' : '')) });
     card.appendChild(el('div', { class: 'pause-title' },
-      chip(isHuman ? '需要人工验证' : '缺少资料', isHuman ? 'chip-purple' : 'chip-orange'),
+      chip(isHuman ? '需要人工验证' : (isReview ? '待确认提交' : '缺少资料'), isHuman ? 'chip-purple' : (isReview ? 'chip-blue' : 'chip-orange')),
       el('span', {}, p.name || p.workId),
       p.courseName ? el('span', { class: 'small muted' }, p.courseName) : null,
       el('span', { class: 'spacer' }),
@@ -1691,11 +1734,72 @@
       return card;
     }
 
+    if (isReview) {
+      card.appendChild(el('div', { class: 'pause-hint' },
+        '检测到主观题/附件题，程序已把答案和附件暂存到学习通。AI 内容可能有误，建议先打开作业页检查，再决定是否提交。'
+      ));
+      var refs = questionRefsBlock(p.reviewQuestions);
+      if (refs) card.appendChild(refs);
+      var openBtn = el('button', {
+        class: 'btn btn-sm', type: 'button',
+        onclick: async function (e) {
+          var btn = e.currentTarget; setBtnBusy(btn, true);
+          try { await api('/api/jobs/' + encodeURIComponent(p.workId) + '/open', { method: 'POST', body: {}, timeout: 60000 }); toast('已在受控浏览器打开作业页', 'ok'); }
+          catch (err) { toast('打开失败：' + errMsg(err), 'error'); }
+          finally { setBtnBusy(btn, false); }
+        }
+      }, '打开作业页');
+      var readyBtn = el('button', {
+        class: 'btn btn-sm', type: 'button',
+        onclick: async function (e) {
+          var btn = e.currentTarget; setBtnBusy(btn, true);
+          try {
+            await api('/api/jobs/' + encodeURIComponent(p.workId) + '/ready', { method: 'POST', body: {}, timeout: 60000 });
+            S.run.paused.delete(p.workId);
+            var job = S.run.jobs.get(p.workId);
+            if (job) job.status = 'ready';
+            toast('已保留暂存，稍后可在学习通手动提交', 'warn');
+          } catch (err) { toast('操作失败：' + errMsg(err), 'error'); }
+          finally { setBtnBusy(btn, false); renderRun(); }
+        }
+      }, '仅保存，稍后手动提交');
+      var submitBtn = el('button', {
+        class: 'btn btn-primary btn-sm', type: 'button',
+        onclick: async function (e) {
+          var ok = await confirmDialog({
+            title: '确认提交作业',
+            body: el('div', {},
+              el('p', {}, '请确认已在作业页检查过答案与附件，且确认 AI 生成内容无误。'),
+              el('p', { class: 'callout callout-danger' }, '提交后会消耗作答机会，通常不可撤回。')
+            ),
+            okText: '确认提交', danger: true
+          });
+          if (!ok) return;
+          var btn = e.currentTarget; setBtnBusy(btn, true);
+          try {
+            await api('/api/jobs/' + encodeURIComponent(p.workId) + '/submit', { method: 'POST', body: {}, timeout: 180000 });
+            S.run.paused.delete(p.workId);
+            var job = S.run.jobs.get(p.workId);
+            if (job) job.status = 'done';
+            toast('提交成功', 'ok');
+          } catch (err) { toast('提交失败：' + errMsg(err), 'error'); }
+          finally { setBtnBusy(btn, false); renderRun(); }
+        }
+      }, '检查完毕，仍然提交');
+      card.appendChild(el('div', { class: 'pause-actions' }, openBtn, readyBtn, submitBtn));
+      return card;
+    }
+
     var folder = 'data\\materials\\' + p.workId;
     card.appendChild(el('div', { class: 'pause-hint' }, '请把所需资料放入以下文件夹，然后点击「继续」：'));
     card.appendChild(el('div', { class: 'answer-box mono', style: 'margin-top:6px' }, folder));
     var detailText = pausedDetailText(p.detail);
     if (detailText) card.appendChild(el('div', { class: 'small muted', style: 'margin-top:6px' }, '缺少：' + detailText));
+    var refsBox = questionRefsBlock(p.missingQuestions);
+    if (refsBox) card.appendChild(refsBox);
+    card.appendChild(el('div', { class: 'callout callout-warn', style: 'margin-top:8px' },
+      el('div', { class: 'callout-body' }, 'AI 定位的题号/缺资料判断不一定准确，请以作业页面为准，自行读题后补充；提供错误资料可能导致答案错误。')
+    ));
     var noteInput = el('input', {
       class: 'input pause-note', type: 'text', placeholder: '补充说明（可选），例如：已放入 实习数据.csv',
       'data-note-for': p.workId, value: S.pauseNotes[p.workId] || ''
@@ -1749,6 +1853,7 @@
       el('div', { class: 'summary-grid' },
         stat('总数', sum.total, 'blue'),
         stat('完成', sum.done, 'green'),
+        sum.ready ? stat('待提交', sum.ready, 'orange') : null,
         stat('暂停', sum.paused, 'orange'),
         stat('失败', sum.failed, 'red')
       )
@@ -1806,7 +1911,7 @@
       box.appendChild(el('div', { class: 'callout callout-warn', style: 'margin-top:12px' },
         el('div', { class: 'callout-icon' }, '!'),
         el('div', { class: 'callout-body' },
-          el('div', { style: 'font-weight:700' }, paused.kind === 'materials' ? '缺少资料，已暂停' : '需要人工验证'),
+          el('div', { style: 'font-weight:700' }, paused.kind === 'materials' ? '缺少资料，已暂停' : (paused.kind === 'review' ? '待确认提交' : '需要人工验证')),
           el('div', {}, paused.reason)
         )
       ));
@@ -1872,7 +1977,17 @@
     if (j.error) {
       box.appendChild(el('div', { class: 'detail-section' },
         el('h4', {}, '错误信息'),
-        el('div', { class: 'callout callout-danger' }, el('div', { class: 'callout-body' }, String(j.error)))
+        el('div', { class: 'callout callout-danger' },
+          el('div', { class: 'callout-body' },
+            el('div', { style: 'font-weight:700' }, String(j.error)),
+            j.errorHint ? el('div', { class: 'small', style: 'margin-top:4px' }, '建议：' + j.errorHint) : null,
+            j.errorCode ? el('div', { class: 'small faint', style: 'margin-top:4px' }, '错误代码：' + j.errorCode) : null
+          )
+        ),
+        j.errorRaw ? el('details', { class: 'detail-section' },
+          el('summary', { class: 'small muted' }, '原始报错（排障用）'),
+          el('pre', { class: 'small mono', style: 'white-space:pre-wrap;word-break:break-word;max-height:200px;overflow:auto' }, String(j.errorRaw))
+        ) : null
       ));
     }
 
@@ -1900,8 +2015,12 @@
     var s = raw && raw.settings ? raw.settings : (raw && raw.config ? raw.config : (raw || {}));
     var timeoutMin = num(s.timeoutMin);
     if (!timeoutMin && num(s.engineTimeoutSec)) timeoutMin = Math.max(1, Math.round(num(s.engineTimeoutSec) / 60));
+    var acc = num(s.targetAccuracy);
+    if (!acc || acc <= 0) acc = DEFAULTS.targetAccuracy;
     return {
       autoSubmit: s.autoSubmit !== undefined ? !!s.autoSubmit : DEFAULTS.autoSubmit,
+      targetAccuracy: acc,
+      reviewBeforeSubmit: s.reviewBeforeSubmit !== undefined ? s.reviewBeforeSubmit !== false : DEFAULTS.reviewBeforeSubmit,
       modelRaw: s.model !== undefined ? s.model : DEFAULTS.model,
       modelText: modelText(s.model),
       port: num(s.port) || DEFAULTS.port,
@@ -2007,7 +2126,31 @@
 
     /* --- 运行设置 --- */
     var autoCb = el('input', { type: 'checkbox', checked: settings.autoSubmit, id: 'set-auto-submit' });
+    var reviewCb = el('input', { type: 'checkbox', checked: settings.reviewBeforeSubmit, id: 'set-review-submit' });
     var timeoutInput = el('input', { class: 'input', id: 'set-timeout', type: 'number', min: '1', max: '120', value: String(settings.timeoutMin) });
+    var ACC_LEVELS = [0.99, 0.9, 0.8, 0.6, 0.3];
+    var ACC_LABELS = ['99%', '90%', '80%', '60%', '30%'];
+    var accIndex = 0;
+    for (var ai = 0; ai < ACC_LEVELS.length; ai += 1) {
+      if (Math.abs(ACC_LEVELS[ai] - settings.targetAccuracy) < Math.abs(ACC_LEVELS[accIndex] - settings.targetAccuracy)) accIndex = ai;
+    }
+    var accRange = el('input', {
+      type: 'range', min: '0', max: String(ACC_LEVELS.length - 1), step: '1', value: String(accIndex),
+      id: 'set-accuracy', class: 'accuracy-range'
+    });
+    var accVal = el('span', { class: 'accuracy-value' }, ACC_LABELS[accIndex]);
+    var accWarn = el('div', { class: 'accuracy-warning' });
+    function updateAcc() {
+      var idx = clamp(num(accRange.value), 0, ACC_LEVELS.length - 1);
+      accVal.textContent = ACC_LABELS[idx];
+      var isLow = ACC_LEVELS[idx] <= 0.3;
+      accWarn.className = 'accuracy-warning' + (isLow ? ' danger' : '');
+      accWarn.textContent = isLow
+        ? '⚠ 30% 档位会故意产生大量错误答案，容易影响成绩或引起注意，请谨慎使用。'
+        : '仅作用于选择题/填空题，按题数比例故意改错；实际正确率受 AI 能力影响，无法保证。';
+    }
+    accRange.addEventListener('input', updateAcc);
+    updateAcc();
 
     var settingsPanel = el('div', { class: 'panel' },
       el('div', { class: 'panel-head' },
@@ -2018,11 +2161,23 @@
         el('div', { class: 'switch-row' },
           el('div', { class: 'field' },
             el('label', { for: 'set-auto-submit' }, '自动提交'),
-            el('div', { class: 'hint' }, '开启后自动填写并提交；关闭则先保存，等待人工确认后提交。')
+            el('div', { class: 'hint' }, '开启后自动填写并提交；关闭则先暂存到学习通，标记为「待提交」，由你手动提交。')
           ),
           el('label', { class: 'switch' }, autoCb, el('span', { class: 'track' }))
         ),
+        el('div', { class: 'switch-row' },
+          el('div', { class: 'field' },
+            el('label', { for: 'set-review-submit' }, '主观题/附件题提交前确认'),
+            el('div', { class: 'hint' }, '默认开启：检测到主观题/附件题时，先暂存并暂停，等你检查后再决定是否提交。')
+          ),
+          el('label', { class: 'switch' }, reviewCb, el('span', { class: 'track' }))
+        ),
         el('div', { class: 'form-grid' },
+          el('div', { class: 'field span-2' },
+            el('label', { for: 'set-accuracy' }, '目标正确率（近似）'),
+            el('div', { class: 'accuracy-line' }, accRange, accVal),
+            accWarn
+          ),
           el('div', { class: 'field' },
             el('label', {}, '模型'),
             el('input', { class: 'input', type: 'text', value: settings.modelText, disabled: true, readonly: true }),
@@ -2050,6 +2205,8 @@
             if (timeoutMin < 1 || timeoutMin > 120) { toast('超时需在 1–120 分钟之间', 'warn'); timeoutInput.focus(); return; }
             var payload = {
               autoSubmit: autoCb.checked,
+              reviewBeforeSubmit: reviewCb.checked,
+              targetAccuracy: ACC_LEVELS[clamp(num(accRange.value), 0, ACC_LEVELS.length - 1)],
               timeoutMin: timeoutMin,
               // 真实服务端使用 engineTimeoutSec（秒），两个字段都发以兼容 mock / 真实服务
               engineTimeoutSec: timeoutMin * 60

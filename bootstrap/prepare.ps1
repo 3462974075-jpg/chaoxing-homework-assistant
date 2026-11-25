@@ -1,4 +1,4 @@
-# Chaoxing Homework Assistant v1.4.0
+# Chaoxing Homework Assistant v1.5.0
 # Copyright (c) 2026 sevenplayer (Lsy). All rights reserved.
 # SPDX-License-Identifier: MIT
 # Powered by DeepSeek (AI-assisted development)

@@ -11,7 +11,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const OUTPUT_ROOT = process.env.CX_OUTPUT_ROOT
   ? path.resolve(process.env.CX_OUTPUT_ROOT)
   : path.join(HERE, 'output');
-const PRODUCT_VERSION = 'v1.4.0';
+const PRODUCT_VERSION = 'v1.5.0';
 const BUILD_ID = new Date().toISOString().slice(0, 10).replace(/-/g, '');
 const DEST = process.env.CX_BUILD_DEST
   ? path.resolve(process.env.CX_BUILD_DEST)
@@ -90,7 +90,7 @@ const stopMessages = {
   done: '可以关闭本窗口了。',
 };
 fs.writeFileSync(path.join(DEST, 'stop-messages.json'), JSON.stringify(stopMessages, null, 2), 'utf8');
-const stopPs1 = `# Chaoxing Homework Assistant v1.4.0
+const stopPs1 = `# Chaoxing Homework Assistant v1.5.0
 # Copyright (c) 2026 sevenplayer (Lsy). All rights reserved.
 # SPDX-License-Identifier: MIT
 # Powered by DeepSeek (AI-assisted development)
@@ -149,7 +149,7 @@ Say 'done' 'You can close this window now.'
 fs.writeFileSync(path.join(DEST, 'stop.ps1'), stopPs1, 'utf8');
 fs.writeFileSync(path.join(DEST, '停止服务.cmd'), [
   '@echo off',
-  'rem Chaoxing Homework Assistant v1.4.0',
+  'rem Chaoxing Homework Assistant v1.5.0',
   'rem Copyright (c) 2026 sevenplayer (Lsy). All rights reserved.',
   'rem SPDX-License-Identifier: MIT',
   'rem Powered by DeepSeek (AI-assisted development)',

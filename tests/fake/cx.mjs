@@ -1,5 +1,5 @@
 /**
- * 学习通作业助手 (Chaoxing Homework Assistant) v1.4.0
+ * 学习通作业助手 (Chaoxing Homework Assistant) v1.5.0
  * Copyright (c) 2026 七号玩家 (sevenplayer / Lsy). All rights reserved.
  * SPDX-License-Identifier: MIT
  * Powered by DeepSeek（AI 辅助开发）
@@ -48,6 +48,8 @@ export async function createCx({ dataDir, edgeProfileDir, log } = {}) {
     },
     async downloadAttachments(work, dir) { return []; },
     async fillAnswers(work, answers) { say('fake fill', work.workId, Object.keys(answers.answers || {}).length); return { ok: true, raw: { status: 1 } }; },
+    async save(work, answers) { say('fake save', work.workId, Object.keys(answers.answers || {}).length); return { ok: true, raw: { status: 1, saved: true } }; },
+    async saveCurrent(work) { say('fake saveCurrent', work.workId); return { ok: true, raw: { status: 1, saved: true } }; },
     async submitAnswers(work, answers) { submitted.add(work.workId); say('fake submit', work.workId); return { ok: true, raw: { status: 1, msg: '提交成功' } }; },
     async uploadAttachment(work, filePath) { say('fake upload', work.workId, filePath); return { ok: true, raw: { status: 1 } }; },
     async close() {},

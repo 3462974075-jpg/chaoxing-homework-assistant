@@ -1,18 +1,18 @@
 /**
- * 学习通作业助手 (Chaoxing Homework Assistant) v1.4.0
+ * 学习通作业助手 (Chaoxing Homework Assistant) v1.5.0
  * Copyright (c) 2026 七号玩家 (sevenplayer / Lsy). All rights reserved.
  * SPDX-License-Identifier: MIT
  * Powered by DeepSeek（AI 辅助开发）
  */
 // 构建 GitHub 开源源码目录（不含运行数据、测试证据、API Key）。
 // 用法：node build-source.mjs
-// 产物：<HERE>/dist-staging/源码/学习通作业助手_源码_v1.4.0/
+// 产物：<HERE>/dist-staging/源码/学习通作业助手_源码_v1.5.0/
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const VERSION = 'v1.4.0';
+const VERSION = 'v1.5.0';
 const STAGE_ROOT = process.env.CX_SOURCE_DEST
   ? path.resolve(process.env.CX_SOURCE_DEST)
   : path.join(HERE, 'dist-staging', '源码', '学习通作业助手_源码_' + VERSION);

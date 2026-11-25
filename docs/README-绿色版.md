@@ -1,4 +1,4 @@
-# 学习通作业助手（绿色免安装版） · v1.4.0
+# 学习通作业助手（绿色免安装版） · v1.5.0
 
 > 作者：**七号玩家（sevenplayer / Lsy）** · 开源协议：MIT License · **Powered by DeepSeek（AI 辅助开发）**
 

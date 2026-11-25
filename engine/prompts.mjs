@@ -1,5 +1,5 @@
 /**
- * 学习通作业助手 (Chaoxing Homework Assistant) v1.4.0
+ * 学习通作业助手 (Chaoxing Homework Assistant) v1.5.0
  * Copyright (c) 2026 七号玩家 (sevenplayer / Lsy). All rights reserved.
  * SPDX-License-Identifier: MIT
  * Powered by DeepSeek（AI 辅助开发）
@@ -268,6 +268,37 @@ export function buildSearchAnswerPrompt({ work, question, materials = '', maxSea
 /** 健康检查提示词 */
 export function buildCheckPrompt() {
   return '只回复两个大写字母：OK。不要调用任何工具，不要输出其它文字。';
+}
+
+/**
+ * 为填空题生成“看起来合理但实际错误”的答案（目标正确率功能用）。
+ * 只用于填空/主观填空型题目，不要生成正确答案。
+ */
+export function buildWrongAnswersPrompt({ work, questions = [], correctAnswers = {}, maxChars = 20000 } = {}) {
+  const list = (questions || []).slice(0, 20).map((q) => ({
+    qid: String(q.qid),
+    type: q.type,
+    stem: String(q.stem || q.title || '').slice(0, 500),
+    blanks: Array.isArray(q.blanks) ? q.blanks.slice(0, 5) : [],
+    correct: correctAnswers[String(q.qid)],
+  }));
+  const lines = [
+    '你是命题/测试数据助手。下面是填空题及其正确答案。',
+    '请为每一题生成一个“看起来像学生作答、但实际错误”的答案：',
+    '- 不要给出正确答案，也不要把正确答案原样包含进去；',
+    '- 答案要简短自然，符合该空的类型（数字/标识符/短语）；',
+    '- 不要解释，不要输出 Markdown。',
+    '',
+    work ? `作业：${work.name || work.workName || work.workId || ''}` : '',
+    '【输出 JSON（必须完全一致）】',
+    '{"answers":{"<qid>":"错误答案"}}',
+    '',
+    '题目：',
+    '```json',
+    JSON.stringify(list, null, 2),
+    '```',
+  ].filter(Boolean).join('\n');
+  return `${lines}\n\n请只输出 \`\`\`json 代码块（不要其它文字）。`.slice(0, maxChars);
 }
 
 /** 兼容旧命名（设计说明里写的是 buildObjectivePrompt/buildSubmissionPrompt/buildShortAnswerPrompt） */
